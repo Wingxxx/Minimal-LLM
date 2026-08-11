@@ -23,12 +23,12 @@
 
 - [ ] **S1 讲解：char-level 分词**
   - 中文按「字符」切分：`"床前明月光"` → `['床','前','明','月','光']`
-  - 词表 = 语料中出现过的所有字符集合（本项目约 2500 个），远小于 token 级（几千~几万）
+  - 词表 = 语料中出现过的所有字符集合（本项目约 2600 个），远小于 token 级（几千~几万）
   - 优点：零分词器依赖、实现简单；缺点：字符间缺乏词边界语义，但足够学会「诗的语言规律」
 
-- [ ] **S2 动手：创建训练语料** `data/corpus.txt`（《唐诗三百首》313 首，约 2.4 万字符 / 约 2500 个不同字符）
+- [ ] **S2 动手：创建训练语料** `data/corpus.txt`（《唐诗三百首》319 首，约 2.7 万字符 / 约 2600 个不同字符）
   - 语料 = 《唐诗三百首》全文（公有领域）：每首诗一行诗题 + 数行正文，格式如下
-  - 执行时从公开文本整理 313 首全文写入本文件（只写诗题与正文，不写作者）
+  - 执行时从公开文本整理 319 首全文写入本文件（只写诗题与正文，不写作者）
 
 ```text
 静夜思
@@ -40,7 +40,7 @@
 登鹳雀楼
 白日依山尽，黄河入海流。
 欲穷千里目，更上一层楼。
-……（其余 310 首同格式，共 313 首）
+……（其余 316 首同格式，共 319 首）
 ```
 
 - [ ] **S3 讲解：包标记 `__init__.py` 的作用**
@@ -53,7 +53,7 @@
 - [ ] **S5 验证：语料可读且规模符合预期**
 
 Run: `python -c "data = open(r'data/corpus.txt', encoding='utf-8').read(); chars = sorted(set(data)); print(len(data), 'chars,', len(chars), 'unique')"`
-Expected: 约 2.4 万 chars，约 2500 unique
+Expected: 约 2.7 万 chars，约 2600 unique
 
 - [ ] **S6 收尾：commit + push**
 
@@ -899,7 +899,7 @@ def get_batch(data, batch_size, ctx_len):
 ```
 
 Run: `python -c "import sys; sys.path.insert(0,'.'); from train import load_corpus, get_batch; text,chars,stoi,itos,data=load_corpus(); x,y=get_batch(data,4,32); print('vocab:', len(chars), 'x:', x.shape, 'y:', y.shape, 'aligned:', (y[:,:-1]==x[:,1:]).all())"`
-Expected: `vocab: ~2500  x: (4, 32)  y: (4, 32)  aligned: True`
+Expected: `vocab: ~2600  x: (4, 32)  y: (4, 32)  aligned: True`
 
 - [ ] **S3 讲解 AdamW 优化器**
   - 一阶矩 `m`（梯度 EMA）：方向；二阶矩 `v`（梯度平方 EMA）：自适应步长——大梯度步长小，小梯度步长大
@@ -995,7 +995,7 @@ Expected: `loss: 7.x -> 6.x`（明显下降），`train smoke PASS`
 - [ ] **S7 完整训练并落 output 文件**
 
 Run: `python train.py *> test/output-train.txt`
-Expected: step 每 200 步打印 loss，末行 `saved -> ...\model.npz`；loss 从 ~7.8（随机基线 ln2500）降到 <4.5
+Expected: step 每 200 步打印 loss，末行 `saved -> ...\model.npz`；loss 从 ~7.9（随机基线 ln2600）降到 <4.5
 
 - [ ] **S8 生成验证：训练成果可视化**
 
@@ -1392,7 +1392,7 @@ Run: `git add cli.py; git commit -m "T7: CLI + README 收尾"; git push`
 
 | 顺序 | 命令 | 产出 | 验收点 |
 |---|---|---|---|
-| T1 | 语料验证 | corpus.txt | 2.4 万 chars / 2500 unique |
+| T1 | 语料验证 | corpus.txt | 2.7 万 chars / 2600 unique |
 | T2 | `python test/test_layers.py` | — | 梯度检查 < 1e-4 |
 | T3 | `python test/test_attention.py` | — | 梯度检查 + KV Cache 一致 + GQA |
 | T4 | `python test/test_gpt.py` | — | loss/KV/save-load |
