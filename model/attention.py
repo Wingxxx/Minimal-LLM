@@ -130,6 +130,24 @@ class MultiHeadAttention:
         self.Wv.zero_grad()
         self.Wo.zero_grad()
 
+    def get_params(self):
+        # 返回 (名称, 参数) 列表，供优化器遍历更新（名字带 Wq./Wk./Wv./Wo. 前缀）
+        out = [("Wq." + a, b) for a, b in self.Wq.get_params()]
+        out += [("Wk." + a, b) for a, b in self.Wk.get_params()]
+        out += [("Wv." + a, b) for a, b in self.Wv.get_params()]
+        out += [("Wo." + a, b) for a, b in self.Wo.get_params()]
+        return out
+
+    def get_grad(self, name):
+        # 按"Wq.W"这类名字取梯度：先按前缀取投影层，再转发剩余名字
+        m, pn = name.split(".", 1)
+        return getattr(self, m).get_grad(pn)
+
+    def set_param(self, name, val):
+        # 按名设参（加载 checkpoint 权重时使用）
+        m, pn = name.split(".", 1)
+        getattr(self, m).set_param(pn, val)
+
     def backward(self, dout):
         """反向传播：把上游梯度 dout 沿前向链路逐层回传，累加各投影层 dW/db。
 
