@@ -1,4 +1,4 @@
-import numpy as np
+from .backend import np  # 计算后端：默认 numpy(CPU)，MINIMAL_GPU=1 切 cupy(GPU)
 
 
 class Linear:

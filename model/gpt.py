@@ -1,4 +1,4 @@
-import numpy as np
+from .backend import np, onp  # 计算后端 np：默认 numpy(CPU)，MINIMAL_GPU=1 切 cupy(GPU)；onp 恒为原生 numpy（落盘用）
 from .layers import Linear, LayerNorm, GELU
 from .attention import MultiHeadAttention
 
@@ -257,12 +257,13 @@ class GPT:
             p[...] = d[name]
 
     def save(self, path):
-        # 存 npz 文件：一键保存全模型参数（T5 训练产出的 checkpoint）
-        np.savez(path, **self.dump_params())
+        # 存 npz 文件：一键保存全模型参数（T5 训练产出的 checkpoint）。
+        # 落盘永远用原生 numpy（onp），GPU 数组先拷回 CPU 再存，保证文件跨设备可读
+        onp.savez(path, **{name: onp.asarray(a) for name, a in self.dump_params().items()})
 
     def load(self, path):
         # 读 npz 文件并写回全部参数
-        d = np.load(path)
+        d = onp.load(path)
         for name, p in self._named_params():
             p[...] = d[name]
 

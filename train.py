@@ -1,7 +1,13 @@
-"""训练循环：数据加载 + char 分词 + AdamW + 训练 + 保存 model.npz"""
-import os
-import numpy as np
+"""训练循环：数据加载 + char 分词 + AdamW + 训练 + 保存 model.npz
 
+GPU 加速：设环境变量 MINIMAL_GPU=1（且已安装 cupy）即全链路跑 GPU，
+否则默认纯 numpy/CPU。计算后端统一由 model.backend 提供。
+"""
+import os
+
+# 计算后端：默认 numpy(CPU)；MINIMAL_GPU=1 时 np=cupy(GPU)。
+# onp 恒为原生 numpy：语料处理留在 CPU（数据量小、切片快），进模型前再搬设备
+from model.backend import np, onp
 from model.gpt import GPT
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -20,7 +26,7 @@ def load_corpus():
     chars = sorted(set(text))              # 全部唯一字符（按编码排序保证确定性）
     stoi = {c: i for i, c in enumerate(chars)}   # 字符 -> id
     itos = {i: c for c, i in stoi.items()}       # id -> 字符（stoi 的逆映射）
-    data = np.array([stoi[c] for c in text], dtype=np.int64)
+    data = onp.array([stoi[c] for c in text], dtype=onp.int64)   # 语料留 CPU（onp）
     return text, chars, stoi, itos, data
 
 
@@ -29,11 +35,12 @@ def get_batch(data, batch_size, ctx_len):
 
     自回归数据格式：位置 t 的输入是 data[i+t]，目标是 data[i+t+1]，
     故 y[:, :-1] == x[:, 1:] 恒成立。返回形状均为 (batch_size, ctx_len)。
+    切片在 CPU（onp）做，返回前搬到计算设备（np.asarray：CPU 零拷贝，GPU 拷入显存）。
     """
-    ix = np.random.randint(0, len(data) - ctx_len, size=batch_size)
-    x = np.stack([data[i:i + ctx_len] for i in ix])
-    y = np.stack([data[i + 1:i + ctx_len + 1] for i in ix])
-    return x, y
+    ix = onp.random.randint(0, len(data) - ctx_len, size=batch_size)
+    x = onp.stack([data[i:i + ctx_len] for i in ix])
+    y = onp.stack([data[i + 1:i + ctx_len + 1] for i in ix])
+    return np.asarray(x), np.asarray(y)
 
 
 class AdamW:
@@ -106,7 +113,8 @@ def train(max_steps=3000, batch_size=8, ctx_len=64,
     每 print_every 步打印一次 loss（下降即训练有效）；每 demo_every 步用当前
     模型续写一句 demo（肉眼见证从乱码到诗句的进化）；训练结束存盘 model.npz。
     """
-    np.random.seed(seed)
+    onp.random.seed(seed)   # 抽题 RNG 恒在 CPU（onp）：与计算后端无关，保证同 seed 可复现
+    np.random.seed(seed)    # 参数初始化 RNG：CPU 下 np==onp（同上），GPU 下为 cupy 随机源
     text, chars, stoi, itos, data = load_corpus()
     model = GPT(vocab_size=len(chars), d_model=64, n_head=4, n_layer=2, ctx_len=ctx_len)
     opt = AdamW(model, lr=peak_lr)                 # AdamW 的记忆按 lr 峰值初始化
@@ -121,7 +129,7 @@ def train(max_steps=3000, batch_size=8, ctx_len=64,
         model.backward()                                          # ⑤ 追责到每层
         opt.step()                                                # ⑥ AdamW 改参数
         if step % print_every == 0 or step == max_steps - 1:
-            print(f"step {step:5d}  lr {opt.lr:.2e}  loss {loss:.4f}")
+            print(f"step {step:5d}  lr {opt.lr:.2e}  loss {loss.item():.4f}")
         if step % demo_every == 0:
             print(f"  生成: {_demo_text(model, stoi, itos)}")
 
