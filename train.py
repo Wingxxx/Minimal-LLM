@@ -107,28 +107,37 @@ def _demo_text(model, stoi, itos, prompt="床前明月光", new_tokens=16):
 
 def train(max_steps=3000, batch_size=8, ctx_len=64,
           warmup_steps=200, peak_lr=3e-4, print_every=200,
-          demo_every=500, seed=0):
+          demo_every=500, seed=0, resume_path=None, start_step=0):
     """主训练循环：抽题 -> 前向 -> loss -> 反向 -> AdamW 更新（学习率走山坡）。
 
     每 print_every 步打印一次 loss（下降即训练有效）；每 demo_every 步用当前
     模型续写一句 demo（肉眼见证从乱码到诗句的进化）；训练结束存盘 model.npz。
+
+    续训：resume_path 传 checkpoint 路径即从旧权重接着训，start_step 是已训步数。
+    学习率曲线按「已训 + 本次」的总步数续走余弦退火（不重头热身），避免浪费。
+    注意：checkpoint 只存模型参数，优化器 m/v 记忆从零重建（影响很小，可接受）。
     """
     onp.random.seed(seed)   # 抽题 RNG 恒在 CPU（onp）：与计算后端无关，保证同 seed 可复现
     np.random.seed(seed)    # 参数初始化 RNG：CPU 下 np==onp（同上），GPU 下为 cupy 随机源
     text, chars, stoi, itos, data = load_corpus()
     model = GPT(vocab_size=len(chars), d_model=64, n_head=4, n_layer=2, ctx_len=ctx_len)
+    if resume_path is not None:                    # 续训：载入旧权重，不重新初始化
+        model.load(resume_path)
+        print(f"续训：已从 {resume_path} 载入（已训 {start_step} 步）")
+    total = start_step + max_steps                 # 累计总步数：lr 退火曲线按它走到终点
     opt = AdamW(model, lr=peak_lr)                 # AdamW 的记忆按 lr 峰值初始化
-    print(f"训练 {max_steps} 步 | 词表 {len(chars)} | 参数 {sum(p.size for _, p in model._named_params()):,}")
+    print(f"训练 {max_steps} 步（累计 {total}） | 词表 {len(chars)} | 参数 {sum(p.size for _, p in model._named_params()):,}")
 
-    for step in range(max_steps):
-        opt.lr = get_lr(step, max_steps, warmup_steps, peak_lr)   # 每步取当日学习率
+    for i in range(max_steps):
+        step = start_step + i                      # 全局步数：续训从上次终点接着数
+        opt.lr = get_lr(step, total, warmup_steps, peak_lr)   # 每步取当日学习率
         x, y = get_batch(data, batch_size, ctx_len)               # ① 抽题
         logits = model.forward(x)                                 # ② 做题（前向）
         loss = model.loss(logits, y)                              # ③ 判卷
         model.zero_grad()                                         # ④ 清账
         model.backward()                                          # ⑤ 追责到每层
         opt.step()                                                # ⑥ AdamW 改参数
-        if step % print_every == 0 or step == max_steps - 1:
+        if step % print_every == 0 or i == max_steps - 1:
             print(f"step {step:5d}  lr {opt.lr:.2e}  loss {loss.item():.4f}")
         if step % demo_every == 0:
             print(f"  生成: {_demo_text(model, stoi, itos)}")
