@@ -23,5 +23,9 @@ np = _cupy if USE_GPU else onp
 
 
 def as_numpy(a):
-    """把张量转成原生 numpy 数组（GPU 数组会拷回 CPU；CPU 数组原样返回）。"""
-    return onp.asarray(a)
+    """把张量转成原生 numpy 数组：GPU(cupy) 数组显式拷回 CPU（.get()），CPU 数组原样返回。
+
+    注意不能用 onp.asarray(a) 走隐式转换——cupy 出于安全会直接报错拒绝，
+    必须经 .get() 显式搬运。numpy 数组没有 .get()，走 onp.asarray 兜底。
+    """
+    return a.get() if hasattr(a, "get") else onp.asarray(a)

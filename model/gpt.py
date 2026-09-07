@@ -1,4 +1,4 @@
-from .backend import np, onp  # 计算后端 np：默认 numpy(CPU)，MINIMAL_GPU=1 切 cupy(GPU)；onp 恒为原生 numpy（落盘用）
+from .backend import np, onp, as_numpy  # 计算后端 np：默认 numpy(CPU)，MINIMAL_GPU=1 切 cupy(GPU)；onp 恒为原生 numpy（落盘用），as_numpy 显式搬运
 from .layers import Linear, LayerNorm, GELU
 from .attention import MultiHeadAttention
 
@@ -252,20 +252,19 @@ class GPT:
         return {name: p.copy() for name, p in self._named_params()}
 
     def load_params(self, d):
-        # 按名写回参数（加载 checkpoint）；p[...]= 原地写入，保持对象引用不变
+        # 按名写回参数（加载 checkpoint）；p[...]= 原地写入，保持对象引用不变。
+        # 写回前经 np.asarray 搬进计算后端：GPU 下 np=cupy，把 numpy 显式拷入显存（隐式整片赋值会报错）
         for name, p in self._named_params():
-            p[...] = d[name]
+            p[...] = np.asarray(d[name])
 
     def save(self, path):
         # 存 npz 文件：一键保存全模型参数（T5 训练产出的 checkpoint）。
-        # 落盘永远用原生 numpy（onp），GPU 数组先拷回 CPU 再存，保证文件跨设备可读
-        onp.savez(path, **{name: onp.asarray(a) for name, a in self.dump_params().items()})
+        # 落盘永远用原生 numpy（onp），GPU 数组经 as_numpy 显式拷回 CPU 再存，保证文件跨设备可读
+        onp.savez(path, **{name: as_numpy(a) for name, a in self.dump_params().items()})
 
     def load(self, path):
-        # 读 npz 文件并写回全部参数
-        d = onp.load(path)
-        for name, p in self._named_params():
-            p[...] = d[name]
+        # 读 npz 文件并写回全部参数（内部复用 load_params 完成设备搬运）
+        self.load_params(onp.load(path))
 
     def zero_grad(self):
         # 清空全模型梯度（backward 用 += 累加，训练每步前必须清零）
