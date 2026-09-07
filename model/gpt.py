@@ -294,7 +294,8 @@ def _sample(logits, temperature=1.0, top_k=None, top_p=None):
         idx = np.argpartition(-probs, k - 1)[:k]      # 得分最高的前 k 个下标
         p2 = probs[idx]
         p2 /= p2.sum()                                # 砍掉长尾后重归一化
-        t = np.random.choice(idx, p=p2)
+        # size=1 显式给大小：cupy 的 choice 不支持不带 size（numpy 可省），统一写法兼容两后端
+        t = np.random.choice(idx, size=1, p=p2)[0]
         return np.array([[t]])
     if top_p is not None:
         order = np.argsort(-probs)                    # 概率从高到低排序
@@ -304,7 +305,7 @@ def _sample(logits, temperature=1.0, top_k=None, top_p=None):
         keep_idx = order[keep]
         p2 = probs[keep_idx]
         p2 /= p2.sum()                                # 重归一化
-        t = np.random.choice(keep_idx, p=p2)
+        t = np.random.choice(keep_idx, size=1, p=p2)[0]
         return np.array([[t]])
-    t = np.random.choice(len(probs), p=probs)         # 原始分布直接采样
+    t = np.random.choice(len(probs), size=1, p=probs)[0]   # 原始分布直接采样
     return np.array([[t]])

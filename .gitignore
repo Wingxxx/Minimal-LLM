@@ -1,3 +1,9 @@
 # Python 字节码缓存
 __pycache__/
 *.py[cod]
+
+# 训练产物（权重存档，不入库）
+model.npz
+
+# GPU 冒烟对照临时缓存（kernel/PTX JIT + 打点文件）
+.smoke_cache/
