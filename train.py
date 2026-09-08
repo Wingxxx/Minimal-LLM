@@ -114,8 +114,8 @@ def train(max_steps=3000, batch_size=8, ctx_len=64,
     模型续写一句 demo（肉眼见证从乱码到诗句的进化）；训练结束存盘 model.npz。
 
     续训：resume_path 传 checkpoint 路径即从旧权重接着训，start_step 是已训步数。
-    学习率曲线按「已训 + 本次」的总步数续走余弦退火（不重头热身），避免浪费。
-    注意：checkpoint 只存模型参数，优化器 m/v 记忆从零重建（影响很小，可接受）。
+    续训期学习率冻结在退火终点值（峰值 10%），不再重新规划余弦曲线——否则曲线
+    重映射会让 lr 跳升、破坏已学好的权重。注意：checkpoint 只存模型参数，m/v 从零重建。
     """
     onp.random.seed(seed)   # 抽题 RNG 恒在 CPU（onp）：与计算后端无关，保证同 seed 可复现
     np.random.seed(seed)    # 参数初始化 RNG：CPU 下 np==onp（同上），GPU 下为 cupy 随机源
@@ -124,13 +124,16 @@ def train(max_steps=3000, batch_size=8, ctx_len=64,
     if resume_path is not None:                    # 续训：载入旧权重，不重新初始化
         model.load(resume_path)
         print(f"续训：已从 {resume_path} 载入（已训 {start_step} 步）")
-    total = start_step + max_steps                 # 累计总步数：lr 退火曲线按它走到终点
+    total = start_step + max_steps                 # 累计总步数（仅展示用；续训不再依它规划 lr）
     opt = AdamW(model, lr=peak_lr)                 # AdamW 的记忆按 lr 峰值初始化
     print(f"训练 {max_steps} 步（累计 {total}） | 词表 {len(chars)} | 参数 {sum(p.size for _, p in model._named_params()):,}")
 
     for i in range(max_steps):
         step = start_step + i                      # 全局步数：续训从上次终点接着数
-        opt.lr = get_lr(step, total, warmup_steps, peak_lr)   # 每步取当日学习率
+        if resume_path is not None:
+            opt.lr = peak_lr * 0.1                 # 续训：冻结在退火终点（峰值 10%），小步精修不跳升
+        else:
+            opt.lr = get_lr(step, total, warmup_steps, peak_lr)   # 从头训：每步取当日学习率
         x, y = get_batch(data, batch_size, ctx_len)               # ① 抽题
         logits = model.forward(x)                                 # ② 做题（前向）
         loss = model.loss(logits, y)                              # ③ 判卷
