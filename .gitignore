@@ -1,9 +1,21 @@
+.trae/
 # Python 字节码缓存
 __pycache__/
 *.py[cod]
 
 # 训练产物（权重存档，不入库）
 model.npz
+model-*.npz
+
+# 语料勘察临时区（全唐诗 raw JSON 卷 + opencc 离线 wheel + 勘察脚本，
+# 总量 ~25MB，不入库；语料净化产物 corpus.txt/val.txt 在 data/ 正常入库）
+_probe/
+
+# A/B 基线旧语料备份（三百首旧 corpus 已存在于 git 历史，无需重复入库）
+data/corpus-300.txt
 
 # GPU 冒烟对照临时缓存（kernel/PTX JIT + 打点文件）
 .smoke_cache/
+
+# 训练运行日志（本地运行产物，脱离权重档无独立意义）
+logs/
