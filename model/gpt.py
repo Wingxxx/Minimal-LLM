@@ -208,12 +208,16 @@ class GPT:
         self.d_pos_emb[offset:offset + T] += dy.sum(axis=0)  # 位置嵌入：跨 batch 求和（广播加法反向）
         return dy
 
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None, kv_cache=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None,
+                 kv_cache=None, logits_processor=None):
         """自回归生成：从 idx [1,T] 续写 max_new_tokens 个 token，返回 [1, T+new]。
 
         kv_cache 为空则内部初始化（每层一份 [K,V] 空缓存）：prefill 一次把整段
         prompt 的 K/V 填满；之后每步只前向最后 1 个 token（增量解码，offset 自动
         取缓存长度，位置嵌入正确），采样出下一个 token 拼回序列，循环生成。
+
+        logits_processor：可选回调 (logits[V], idx[1,T]) -> logits[V]，采样前对得分做
+        一次加工；默认 None 时行为与旧版逐位一致（内核不感知任何外置规则）。
         """
         if kv_cache is None:
             head_dim = self.d_model // self.n_head    # 每头维度（与注意力层一致）
@@ -224,8 +228,12 @@ class GPT:
         self.forward(idx, kv_cache)                   # prefill：整段 prompt 前向，顺带填满缓存
         for _ in range(max_new_tokens):
             logits = self.forward(idx[:, -1:], kv_cache)  # decode：每次只喂最后 1 个 token
-            # logits[0, -1, :]：B=1 生成，取末位置得分 -> 一维 [V] 交给采样器
-            next_token = _sample(logits[0, -1, :], temperature, top_k, top_p)  # 采样 [1,1]
+            # logits[0, -1, :]：B=1 生成，取末位置得分 -> 一维 [V]
+            step_logits = logits[0, -1, :]
+            if logits_processor is not None:
+                # 通用钩子：采样前对得分做一次加工（句长约束等外置规则），内核不感知规则内容
+                step_logits = logits_processor(step_logits, idx)
+            next_token = _sample(step_logits, temperature, top_k, top_p)  # 采样 [1,1]
             idx = np.concatenate([idx, next_token], axis=1)   # 新 token 拼回序列
         return idx
 

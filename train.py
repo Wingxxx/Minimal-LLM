@@ -18,6 +18,7 @@ import os
 # onp 恒为原生 numpy：语料处理留在 CPU（数据量小、切片快），进模型前再搬设备
 from model.backend import np, onp, as_numpy
 from model.gpt import GPT
+from meter import make_meter_processor
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DATA_PATH = os.path.join(BASE, "data", "corpus.txt")   # 训练语料（全唐诗简体净流）
@@ -127,20 +128,25 @@ def get_lr(step, anneal_total, warmup_steps, peak_lr):
     return peak_lr * 0.5 * (1 + np.cos(np.pi * p)) * 0.9 + peak_lr * 0.1
 
 
-def _demo_text(model, stoi, itos, prompts=None, new_tokens=16):
-    """对多条 prompt 各续写一段，拼接返回；prompt 有字符不在词表即跳过该条（防 KeyError）。
-
-    prompts 为 None 时用模块级 DEMO_PROMPTS；词表变化（换语料）后旧 prompt 可能
-    含生僻新字，程序化校验保证了永不因缺字崩溃。
-    """
+def _demo_text(model, stoi, itos, prompts=None, new_tokens=16, enforce_meter=True):
     if prompts is None:
         prompts = DEMO_PROMPTS
+    punct_ids = [stoi[c] for c in ("，", "。") if c in stoi]
+    # 非汉字 token（换行、其他标点等）：半句内一律禁绝，且不计入句长额度
+    non_hanzi_ids = [i for c, i in stoi.items() if not ("\u4e00" <= c <= "\u9fff")]
+    newline_id = stoi.get("\n")
     outs = []
     for prompt in prompts:
         if not all(c in stoi for c in prompt):
-            continue                                # 词表外字符 → 本条跳过
-        pid = np.array([[stoi[c] for c in prompt]], dtype=np.int64)   # prompt 编码成 id
-        out = model.generate(pid, new_tokens, temperature=1.0, top_k=5)  # KV Cache 增量生成
+            continue
+        processor = None
+        if enforce_meter and len(punct_ids) == 2:   # 每条独立处理器
+            processor = make_meter_processor(punct_ids, stoi["，"], stoi["。"],
+                                             non_hanzi_ids=non_hanzi_ids,
+                                             newline_id=newline_id)
+        pid = np.array([[stoi[c] for c in prompt]], dtype=np.int64)
+        out = model.generate(pid, new_tokens, temperature=1.0, top_k=5,
+                             logits_processor=processor)
         outs.append(prompt + "".join(itos[int(i)] for i in out[0][len(prompt):]))
     return " | ".join(outs) if outs else "(全部 prompt 含词表外字符，已跳过)"
 
