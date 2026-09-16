@@ -23,38 +23,104 @@ from meter import make_meter_processor
 BASE = os.path.dirname(os.path.abspath(__file__))
 DATA_PATH = os.path.join(BASE, "data", "corpus.txt")   # 训练语料（全唐诗简体净流）
 VAL_PATH = os.path.join(BASE, "data", "val.txt")       # 独立验证集（400 首，与训练同构）
+META_PATH = os.path.join(BASE, "data", "meta.npz")     # 逐位置元信息（权重/平仄/韵部/区标）
+L_BASE_PATH = os.path.join(BASE, "model-ext.npz")      # 遗忘基线 L_base 的锚模型（扩词表迁移档）
 CKPT_PATH = os.path.join(BASE, "model.npz")            # 训练/续训存档位
 CKPT_VERSION = 2                                       # checkpoint 格式版本：2 = 真续训
 # demo 默认 prompts：程序化校验 ⊆ 词表，不全即跳过（新语料词表大，防 KeyError）
 DEMO_PROMPTS = ["床前明月光", "白日依山尽", "春眠不觉晓", "海上生明月", "大漠孤烟直"]
+# 诗体特殊 token：顺序须与 tools/build_corpus.POEM_TAGS 逐项相同（防两处定义漂移），
+# 词表构造时追加在纯文本字符之后（id 8196..8200）。跨模块一致性由 test/test_tokenizer.py 锁定。
+SPECIAL_TOKENS = ("<五绝>", "<七绝>", "<五律>", "<七律>", "<杂言>")
+
+
+def _strip_special_tokens(text):
+    """剥去文本中全部诗体特殊 token，返回纯文本（用于构造不含 < > 的字符词表）。"""
+    for tok in SPECIAL_TOKENS:
+        text = text.replace(tok, "")
+    return text
+
+
+_DEFAULT_STOI = None    # encode 省略 stoi 参数时的默认词表（首次使用时构建并缓存）
+
+
+def _default_stoi():
+    """返回默认语料的完整词表（含特殊 token），首次调用时构建并缓存。"""
+    global _DEFAULT_STOI
+    if _DEFAULT_STOI is None:
+        _DEFAULT_STOI = load_corpus()[2]
+    return _DEFAULT_STOI
+
+
+def encode(text, stoi=None):
+    """把文本编码为 token id 序列：先匹配特殊 token，未匹配处逐字符查 stoi。
+
+    特殊 token（如 <五绝>）在文本中占 4 字符、在 token 流中计 1 个 id；
+    `<` 不出现在纯文本字符集中，故按 SPECIAL_TOKENS 逐个前缀匹配无歧义。
+    词表外字符跳过（OOV skip，与验证集编码口径一致）；stoi 省略时使用默认语料词表。
+    返回与现有 data 同 dtype 的 onp.int64 数组。
+    """
+    if stoi is None:
+        stoi = _default_stoi()
+    specials = [(tok, stoi[tok]) for tok in SPECIAL_TOKENS if tok in stoi]
+    ids = []
+    i, n = 0, len(text)
+    while i < n:
+        if text[i] == "<":                 # 特殊 token 均以 < 起头，先做廉价前缀判定
+            for tok, tid in specials:
+                if text.startswith(tok, i):
+                    ids.append(tid)
+                    i += len(tok)
+                    break
+            else:
+                i += 1                     # 非特殊 token 的 < → 按词表外字符跳过
+            continue
+        c = text[i]
+        if c in stoi:
+            ids.append(stoi[c])
+        i += 1
+    return onp.array(ids, dtype=onp.int64)
 
 
 def load_corpus(data_path=None):
-    """读语料文本，建字符级分词：stoi（字符→id）与 itos（id→字符），整段转 id 数组。
+    """读语料文本，建「纯文本字符 + 诗体特殊 token」词表，整段编码成 id 数组。
 
-    返回 (text, chars, stoi, itos, data)：data 是全文的 token id 序列，
-    训练时按随机窗口切片（见 get_batch），生成时用 itos 把 id 还原成汉字。
+    chars 由「剥去特殊 token 后的纯文本」构造：语料每首诗首行前插有诗体标签
+    （如 <五绝>），若直接对原文取字符集会把 < > 收进词表，故先剥离标签再取字符集。
+    stoi 先放纯文本字符（id 0..len(chars)-1），再把 SPECIAL_TOKENS 追加在末尾。
+
+    返回 (text, chars, stoi, itos, data, special_ids)：
+      text        —— 语料原文（含诗体标签）。
+      chars       —— 纯文本字符表（剥去标签后的字符集，按编码排序）。
+      stoi/itos   —— 含特殊 token 的完整映射（长度 len(chars) + 5）。
+      data        —— 全文 token 序列（每个特殊 token 计 1 个 id，训练切片用）。
+      special_ids —— 5 个特殊 token 的 id 列表（顺序与 SPECIAL_TOKENS 一致）。
     """
     with open(data_path or DATA_PATH, encoding="utf-8") as f:
         text = f.read()
-    chars = sorted(set(text))              # 全部唯一字符（按编码排序保证确定性）
-    stoi = {c: i for i, c in enumerate(chars)}   # 字符 -> id
-    itos = {i: c for c, i in stoi.items()}       # id -> 字符（stoi 的逆映射）
-    data = onp.array([stoi[c] for c in text], dtype=onp.int64)   # 语料留 CPU（onp）
-    return text, chars, stoi, itos, data
+    chars = sorted(set(_strip_special_tokens(text)))     # 纯文本字符（不含标签字符 < >）
+    stoi = {c: i for i, c in enumerate(chars)}           # 字符 -> id（0..len(chars)-1）
+    base = len(chars)
+    special_ids = []
+    for k, tok in enumerate(SPECIAL_TOKENS):             # 特殊 token 追加在末尾
+        stoi[tok] = base + k
+        special_ids.append(base + k)
+    itos = {i: c for c, i in stoi.items()}               # id -> 字符（stoi 的逆映射）
+    data = encode(text, stoi)                            # 含特殊 token id 的完整序列
+    return text, chars, stoi, itos, data, special_ids
 
 
 def load_val(val_path, stoi):
     """读独立验证集并按训练词表编码；词表外字符（OOV）跳过——val 只评估模型见过的字。
 
-    验证集同构于训练（一联一行），但不参与训练；文件缺失时返回 None（关闭 val 监控）。
+    编码口径与 encode 一致：先匹配诗体特殊 token，未匹配处逐字符查 stoi，
+    无法匹配的字符跳过。文件缺失时返回 None（关闭 val 监控）。
     """
     if not os.path.exists(val_path):
         return None
     with open(val_path, encoding="utf-8") as f:
         text = f.read()
-    ids = [stoi[c] for c in text if c in stoi]
-    return onp.array(ids, dtype=onp.int64)
+    return encode(text, stoi)
 
 
 def get_batch(data, batch_size, ctx_len):
@@ -68,6 +134,88 @@ def get_batch(data, batch_size, ctx_len):
     x = onp.stack([data[i:i + ctx_len] for i in ix])
     y = onp.stack([data[i + 1:i + ctx_len + 1] for i in ix])
     return np.asarray(x), np.asarray(y)
+
+
+def load_meta(path=None):
+    """载入逐位置元信息 data/meta.npz，返回原生 numpy 数组字典。
+
+    四数组长度均等于语料 token 数 L，下标为 token 在 data 中的绝对位置：
+      weights      float32 —— 该位置 token 作为 target 时的主损失权重；
+      tone_labels  int8    —— 平仄标签（0=平 1=仄 2=未覆盖/非汉字）；
+      rhyme_labels int16   —— 韵部 id（0=unknown，1..106=韵部）；
+      zone_tags    int8    —— 位置属性（0=常态 1=韵脚 2=半句末标点 3=特殊 token 4=对仗区）。
+    返回原生 numpy（onp）数组，训练期由 get_batch_ext 在 CPU 切片后再搬设备。
+    """
+    d = dict(onp.load(path or META_PATH))
+    return {"weights": d["weights"], "tone_labels": d["tone_labels"],
+            "rhyme_labels": d["rhyme_labels"], "zone_tags": d["zone_tags"]}
+
+
+def derive_masks(tone_labels, rhyme_labels, weights):
+    """派生辅助头逐位置掩码，返回 (tone_mask, rhyme_mask) 两个 bool 数组。
+
+    tone_mask  = (tone_labels != 2)             覆盖「非汉字」与「韵书未见字」
+    rhyme_mask = (weights == 2.0) & (rhyme_labels != 0)
+
+    韵脚掩码仅以「离线原始 weights == 2.0」为判据，**禁止**由 zone_tags == 1 派生：
+    zone_tags 优先级为「特殊 token(3) > 对仗区(4) > 韵脚(1) > 半句末标点(2) > 常态(0)」，
+    颔联/颈联内的韵脚会被标为 4 而丢失监督。weights 取值仅 {1.0, 1.5, 2.0}，2.0 与韵脚
+    严格一一对应。传入的 weights 必须是**未融合 duizhang_weight 的离线原始权重**；
+    融合后的 w 在 duizhang_weight == 2.0 时会引入对仗区假韵脚，故取批时须先派生掩码、
+    再做融合。后半项兑现「韵脚字未被韵书覆盖（rhyme_labels == 0）则跳过」。
+    """
+    tone_mask = tone_labels != 2
+    rhyme_mask = (weights == 2.0) & (rhyme_labels != 0)
+    return tone_mask, rhyme_mask
+
+
+def get_batch_ext(data, meta, batch_size, ctx_len, duizhang_weight=1.0):
+    """取加权训练批次 + 辅助头标签与掩码，返回 7 元组。
+
+    返回 (x, y, w, tone_t, tone_m, rhyme_t, rhyme_m)，形状均 (batch_size, ctx_len)：
+      x       = data[s : s+T]              输入；
+      y       = data[s+1 : s+1+T]          目标（右移一位）；
+      w       = maximum(weights[s+1:s+1+T], (zone_tags[s+1:s+1+T] == 4) * duizhang_weight)
+                逐位置主损失权重：先取离线权重，再按「取最大」（非叠乘）融合对仗区权重；
+      tone_t  = tone_labels[s+1 : s+1+T]   平仄标签（与 y 同起点同长度）；
+      tone_m  = tone_t != 2                平仄头掩码；
+      rhyme_t = rhyme_labels[s+1 : s+1+T] 韵部标签（与 y 同起点同长度）；
+      rhyme_m = (weights[s+1:s+1+T] == 2.0) & (rhyme_t != 0)  韵部头掩码。
+
+    起点 s 满足 s + 1 + T <= len(data)（断言保护）；掩码一律基于**未融合**的原始
+    weights 派生后再做融合。**纯切片、零解析**：除布尔比较与 maximum 外不做任何
+    Python 逐字符处理。切片在 CPU（onp）做，返回前 np.asarray 搬到计算设备
+    （与 get_batch 同风格：CPU 零拷贝，GPU 拷入显存）。
+    """
+    T = ctx_len
+    weights = meta["weights"]
+    tone_labels = meta["tone_labels"]
+    rhyme_labels = meta["rhyme_labels"]
+    zone_tags = meta["zone_tags"]
+    n = len(data)
+    assert n == len(weights) == len(tone_labels) == len(rhyme_labels) == len(zone_tags), (
+        f"data 与 meta 数组长度不一致：data={n} weights={len(weights)} "
+        f"tone={len(tone_labels)} rhyme={len(rhyme_labels)} zone={len(zone_tags)}")
+    s = onp.random.randint(0, n - T, size=batch_size)
+    assert int(s.max()) + 1 + T <= n, (
+        f"起点越界：max(s)+1+T={int(s.max()) + 1 + T} > len(data)={n}")
+    x = onp.stack([data[i:i + T] for i in s])
+    y = onp.stack([data[i + 1:i + 1 + T] for i in s])
+    w_raw = onp.stack([weights[i + 1:i + 1 + T] for i in s])       # 未融合的原始权重
+    zone = onp.stack([zone_tags[i + 1:i + 1 + T] for i in s])
+    tone_t = onp.stack([tone_labels[i + 1:i + 1 + T] for i in s])
+    rhyme_t = onp.stack([rhyme_labels[i + 1:i + 1 + T] for i in s])
+    # 先派生掩码（基于未融合 w_raw），再做对仗区融合——顺序不可颠倒
+    tone_m, rhyme_m = derive_masks(tone_t, rhyme_t, w_raw)
+    w = onp.maximum(w_raw, (zone == 4) * duizhang_weight)
+    assert x.shape == y.shape == (batch_size, T), f"x/y 形状异常：{x.shape}/{y.shape}"
+    assert w.shape == tone_t.shape == tone_m.shape == (batch_size, T), \
+        f"w/tone_t/tone_m 形状异常：{w.shape}/{tone_t.shape}/{tone_m.shape}"
+    assert rhyme_t.shape == rhyme_m.shape == (batch_size, T), \
+        f"rhyme_t/rhyme_m 形状异常：{rhyme_t.shape}/{rhyme_m.shape}"
+    assert onp.array_equal(x[:, 1:], y[:, :-1]), "x/y 自回归对齐错误：x[:,1:] 应等于 y[:,:-1]"
+    return (np.asarray(x), np.asarray(y), np.asarray(w), np.asarray(tone_t),
+            np.asarray(tone_m), np.asarray(rhyme_t), np.asarray(rhyme_m))
 
 
 class AdamW:
@@ -128,7 +276,12 @@ def get_lr(step, anneal_total, warmup_steps, peak_lr):
     return peak_lr * 0.5 * (1 + np.cos(np.pi * p)) * 0.9 + peak_lr * 0.1
 
 
-def _demo_text(model, stoi, itos, prompts=None, new_tokens=16, enforce_meter=True):
+def _demo_text(model, stoi, itos, prompts=None, new_tokens=16, enforce_meter=False):
+    """对多条 prompt 续写并拼成一行；enforce_meter=True 时叠加句长/标点约束处理器。
+
+    默认 False：展示模型**未经约束**的原生输出，用于目检格律是否已内化；
+    需对照「约束关」效果时显式传 True。
+    """
     if prompts is None:
         prompts = DEMO_PROMPTS
     punct_ids = [stoi[c] for c in ("，", "。") if c in stoi]
@@ -167,6 +320,34 @@ def estimate_val_loss(model, val_data, ctx_len, n_batch=4, seed=1234):
         logits = model.forward(np.asarray(x))
         losses.append(model.loss(logits, np.asarray(y)).item())
     return float(onp.mean(losses))
+
+
+def _aux_accuracy(model, tone_t, tone_m, rhyme_t, rhyme_m):
+    """按掩码统计辅助头 argmax 准确率，返回 (tone_acc, rhyme_acc)，各项可为 None。
+
+    对启用且当前批次含有效位（mask 求和 > 0）的头，取 argmax(预测) 与 target 逐位比对、
+    仅在 mask 为真处求均值；未启用的头（对应 logits 为 None）或无有效位的头返回 None。
+    两头皆为 None 时整体返回 None（供打印端输出「aux -」）。
+
+    设备搬运一律经 as_numpy 显式拷回 CPU 后再做 numpy 统计：logits 与标签/掩码在
+    GPU(cupy) 后端下为设备数组，禁止用 onp.asarray 隐式转换（cupy 会直接抛
+    TypeError）；CPU 下 as_numpy 为零拷贝透传，数值结果不变。
+    """
+    tone_acc = None
+    if getattr(model, "tone_logits", None) is not None:
+        pred = as_numpy(model.tone_logits).argmax(axis=-1)
+        m = as_numpy(tone_m).astype(bool)
+        if m.any():
+            tone_acc = float((pred[m] == as_numpy(tone_t)[m]).mean())
+    rhyme_acc = None
+    if getattr(model, "rhyme_logits", None) is not None:
+        pred = as_numpy(model.rhyme_logits).argmax(axis=-1)
+        m = as_numpy(rhyme_m).astype(bool)
+        if m.any():
+            rhyme_acc = float((pred[m] == as_numpy(rhyme_t)[m]).mean())
+    if tone_acc is None and rhyme_acc is None:
+        return None
+    return tone_acc, rhyme_acc
 
 
 # ───────────────────────── checkpoint（真续训格式）─────────────────────────
@@ -249,6 +430,30 @@ def load_checkpoint(path, model, opt=None, expect_chars=None, expect_sched=None)
     return t
 
 
+def load_params_partial(path, model):
+    """按名载入 checkpoint 中**模型已有**的参数，返回缺失（新增）参数个数。
+
+    跨里程碑续训专用（M1 -> M2 增挂辅助头等）：仅写入双方共有的参数名，模型多出的
+    新参数保留自身初始化值。**严禁**用 load_checkpoint 承担此职责——它逐名读取
+    `_opt.m.{name}`，M1 档缺 `_opt.m.tone_head.*` 键会直接 KeyError（且调度签名与
+    词表快照也不匹配）。本函数只读非 "_" 前缀键（即模型参数），天然跳过
+    `_opt.*` / `_sched.*` / `_chars` / `_ckpt_version` 等元数据键。
+    形状不一致时断言失败；载入后打印缺失参数个数。
+    """
+    d = dict(onp.load(path))
+    missing = 0
+    for name, p in model._named_params():
+        if name in d:
+            arr = onp.asarray(d[name])
+            assert tuple(arr.shape) == tuple(p.shape), (
+                f"参数 {name} 形状不一致：档内 {tuple(arr.shape)} vs 模型 {tuple(p.shape)}")
+            p[...] = np.asarray(arr)            # np.asarray：CPU 零拷贝 / GPU 显式拷入
+        else:
+            missing += 1
+    print(f"按名载参 {path}：缺失 {missing} 个新增参数，按初始化保留")
+    return missing
+
+
 # ─────────────────────────────── 主训练循环 ────────────────────────────────
 
 def train(max_steps=3000, batch_size=8, ctx_len=64,
@@ -256,25 +461,56 @@ def train(max_steps=3000, batch_size=8, ctx_len=64,
           demo_every=500, seed=0, resume_path=None, start_step=0,
           d_model=64, n_head=4, n_layer=2,
           anneal_total=None, save_every=None, demo_prompts=None,
-          data_path=None, val_path=None, ckpt_path=None, val_n_batch=4):
-    """主训练循环：抽题 -> 前向 -> loss -> 反向 -> AdamW 更新（学习率走山坡）。
+          data_path=None, val_path=None, ckpt_path=None, val_n_batch=16,
+          base_path=None, n_rhyme=0, use_tone=False, lam_tone=0.3, lam_rhyme=0.5,
+          rhyme_classes=107, meta_path=None, duizhang_weight=1.0, lr_scale=1.0,
+          l_base_path=None):
+    """主训练循环：抽题（含权重/辅助标签） -> 前向 -> 加权损失+辅助损失 -> 反向 -> AdamW。
 
-    每 print_every 步打印 loss（+ val loss）；每 demo_every 步对多条 prompt 续写
-    目检生成进化；正常结束存终档 ckpt_path；save_every 间隔额外存 model-{step}.npz
-    中间档；KeyboardInterrupt/异常时 finally 先落盘断点再退出（中断兜底）。
+    每 print_every 步为监控节拍：算 val loss 与 val_ratio（= val_loss / L_base）并打印
+    step/lr/loss/val/val_ratio/aux_acc；每 demo_every 步对多条 prompt 续写目检生成进化；
+    正常结束存终档 ckpt_path；save_every 间隔额外存中间档；KeyboardInterrupt/异常时
+    finally 先落盘断点再退出（中断兜底）。
+
+    分段/里程碑接线：
+      - base_path 非 None：按名载入共有参数（load_params_partial），模型新增参数
+        保留初始化；**跨里程碑严禁走 load_checkpoint**（M1 档缺 _opt.m.tone_head.* 键）。
+      - n_rhyme>0 / use_tone：挂载韵部头/平仄头；n_rhyme>0 时须等于 rhyme_classes。
+      - meta_path：逐位置元信息（默认 data/meta.npz），供加权主损失与辅助标签切片；
+        必须与语料同长，长度不符直接抛 AssertionError（不退化）；自定义语料须显式传入
+        与之匹配的 meta_path，否则须重建 meta（tools/build_corpus.py）。
+      - duizhang_weight：对仗区权重（取最大融合，M3 起设 1.5）。
+      - lr_scale：运行期学习率标量，乘在 get_lr 之后（遗忘红线的折半开关）。
+      - l_base_path：遗忘基线 L_base 的锚模型（默认 model-ext.npz），仅 val 可用时计算。
 
     续训：resume_path 指向真格式 checkpoint——载入参数/m/v 与词表、调度签名校验，
-    已训步数取档内 opt.t（自动衔接，不依赖调用方数步）。anneal_total 为全局退火
-    终点（默认 = 本段起点 + max_steps，兼容旧单段语义；S4/S5 分段续训请显式传
-    全局终点，如 30000，使各段 lr 曲线连续）。
+    已训步数取档内 opt.t（自动衔接）。anneal_total 为全局退火终点（默认 = 本段起点 +
+    max_steps）。save_every 须显式等于 print_every（保证每个监控点都有可回滚中间档）。
     """
+    if n_rhyme > 0:
+        assert n_rhyme == rhyme_classes, (
+            f"n_rhyme（{n_rhyme}）必须与 rhyme_classes（{rhyme_classes}）相等："
+            "二者同源，防韵部类别数漂移")
+    if save_every is not None and save_every != print_every:
+        raise ValueError(f"save_every（{save_every}）必须等于 print_every（{print_every}），"
+                         "以保证每个监控点都有中间档可回滚")
     onp.random.seed(seed)   # 抽题 RNG 恒在 CPU（onp）：与计算后端无关，保证同 seed 可复现
     np.random.seed(seed)    # 参数初始化 RNG：CPU 下 np==onp（同上），GPU 下为 cupy 随机源
-    text, chars, stoi, itos, data = load_corpus(data_path)         # 训练语料
+    text, chars, stoi, itos, data, special_ids = load_corpus(data_path)   # 训练语料
     val_data = load_val(val_path or VAL_PATH, stoi)                # 验证集（无则 None）
-    model = GPT(vocab_size=len(chars), d_model=d_model, n_head=n_head,
-                n_layer=n_layer, ctx_len=ctx_len)
-    opt = AdamW(model, lr=peak_lr)                 # AdamW 的记忆按 lr 峰值初始化
+    # 逐位置元信息（默认 data/meta.npz）：必须与语料同源同长，长度不符直接断言失败，不退化
+    meta = load_meta(meta_path)
+    assert len(data) == len(meta["weights"]) == len(meta["tone_labels"]) == \
+        len(meta["rhyme_labels"]) == len(meta["zone_tags"]), (
+            f"语料与 meta 长度不一致：语料={len(data)} weights={len(meta['weights'])} "
+            f"tone={len(meta['tone_labels'])} rhyme={len(meta['rhyme_labels'])} "
+            f"zone={len(meta['zone_tags'])}。语料与 meta 必须同源；自定义语料请显式传入"
+            "与之匹配的 meta_path，否则请重建 meta（tools/build_corpus.py）")
+    model = GPT(vocab_size=len(stoi), d_model=d_model, n_head=n_head,
+                n_layer=n_layer, ctx_len=ctx_len, n_rhyme=n_rhyme, use_tone=use_tone)
+    if base_path is not None:                      # 按名载参（跨里程碑续训，严禁 load_checkpoint）
+        load_params_partial(base_path, model)
+    opt = AdamW(model, lr=peak_lr)                 # fresh AdamW：不继承任何优化器状态
     # ── 续训：真格式校验 + 读档；起点取档内 opt.t（权威）──
     start = start_step
     if resume_path is not None:
@@ -286,29 +522,80 @@ def train(max_steps=3000, batch_size=8, ctx_len=64,
         print(f"续训：已从 {resume_path} 载入（checkpoint 已训 {start} 步）")
     anneal_total = anneal_total if anneal_total is not None else start + max_steps
     n_param = sum(p.size for _, p in model._named_params())
-    print(f"训练 {max_steps} 步（起点 {start}，退火终点 {anneal_total}）| 词表 {len(chars)} "
+    print(f"训练 {max_steps} 步（起点 {start}，退火终点 {anneal_total}）| 词表 {len(stoi)} "
           f"| d{d_model}/h{n_head}/L{n_layer} | 参数 {n_param:,}"
-          + (" | 启用 val loss" if val_data is not None else ""))
+          + (" | 启用 val loss" if val_data is not None else "")
+          + (f" | 韵部头 {n_rhyme}" if n_rhyme > 0 else "")
+          + (" | 平仄头" if use_tone else ""))
+    # 遗忘基线 L_base：在扩词表迁移档 model-ext.npz 上、同 ctx/val 口径算一次 val loss，
+    # 使各里程碑的 val_ratio 可比（不可用旧 model.npz 数值充数：词表已 8196 → 8201）
+    l_base = None
+    if val_data is not None:
+        l_base_path = l_base_path or L_BASE_PATH
+        if os.path.exists(l_base_path):
+            anchor = GPT(vocab_size=len(stoi), d_model=d_model, n_head=n_head,
+                         n_layer=n_layer, ctx_len=ctx_len)          # 同架构临时锚模型
+            load_params_partial(l_base_path, anchor)
+            l_base = estimate_val_loss(anchor, val_data, ctx_len, val_n_batch)
+            del anchor
+            print(f"L_base（{l_base_path}）= {l_base:.4f}")
+        else:
+            print(f"L_base：未找到锚模型 {l_base_path}，本次不输出 val_ratio")
     done = False                                 # 正常完成标记：finally 据此判断是否兜底存档
+    over_line = 0                                # val_ratio 连续越线计数（遗忘红线预案 1）
     try:
         for i in range(max_steps):
             step = start + i                      # 全局步数：续训从档内步数接着数
-            opt.lr = get_lr(step, anneal_total, warmup_steps, peak_lr)  # 全局调度回放
-            x, y = get_batch(data, batch_size, ctx_len)               # ① 抽题
-            logits = model.forward(x)                                 # ② 做题（前向）
-            loss = model.loss(logits, y)                              # ③ 判卷
-            model.zero_grad()                                         # ④ 清账
-            model.backward()                                          # ⑤ 追责到每层
-            opt.step()                                                # ⑥ AdamW 改参数
-            if save_every and step and step % save_every == 0:        # 中间存档（可断点续）
+            # ① 抽题：主损失权重 + 平仄/韵部标签与掩码（纯切片，零解析）
+            x, y, w, tone_t, tone_m, rhyme_t, rhyme_m = get_batch_ext(
+                data, meta, batch_size, ctx_len, duizhang_weight)
+            opt.lr = get_lr(step, anneal_total, warmup_steps, peak_lr) * lr_scale  # ② lr（含预案）
+            logits = model.forward(x)                                 # ③ 前向
+            loss = model.loss(logits, y, w)                           # ④ 加权主损失
+            if n_rhyme > 0 or use_tone:                               # ⑤ 辅助损失（仅启用时）
+                model.aux_loss(tone_t, tone_m, rhyme_t, rhyme_m, lam_tone, lam_rhyme)
+            model.zero_grad()                                         # ⑥ 清账
+            model.backward()                                          # ⑦ 反向（含辅助头回传）
+            opt.step()                                                # ⑧ AdamW 改参数
+            monitor = (step % print_every == 0) or (i == max_steps - 1)
+            v = None
+            val_ratio = None
+            acc = None
+            if monitor:
+                # 先取辅助头准确率：estimate_val_loss 会前向验证窗口并覆写 tone_logits/
+                # rhyme_logits 缓存，故须在算 val 之前基于本训练批次的前向缓存取值
+                acc = _aux_accuracy(model, tone_t, tone_m, rhyme_t, rhyme_m)
+            if monitor and val_data is not None:                      # 先算 val_ratio（存档标记需要）
+                v = estimate_val_loss(model, val_data, ctx_len, val_n_batch)
+                if l_base is not None:
+                    val_ratio = v / l_base
+            if val_ratio is not None:                                 # 预案 1：连续 2 次越线 → lr 折半
+                over_line = over_line + 1 if val_ratio > 1.05 else 0
+                if over_line >= 2:
+                    lr_scale *= 0.5
+                    print(f"  [预案] val_ratio 连续 2 次 > 1.05，lr_scale 折半为 {lr_scale:g}")
+                    over_line = 0
+            if save_every and step and step % save_every == 0:        # 中间存档（带合格回滚点标记）
                 mid = _mid_ckpt_path(ckpt_path or CKPT_PATH, step)
                 save_checkpoint(mid, model, opt, chars, anneal_total, warmup_steps, peak_lr)
-                print(f"  [存档] 已保存中间档 {mid}")
-            if step % print_every == 0 or i == max_steps - 1:
+                if val_ratio is not None and val_ratio <= 1.05:
+                    print(f"  [存档] {mid}（合格回滚点 val_ratio={val_ratio:.4f}）")
+                else:
+                    shown = "无" if val_ratio is None else f"{val_ratio:.4f}"
+                    print(f"  [存档] {mid}（不合格 val_ratio={shown}）")
+            if monitor:
                 line = f"step {step:5d}  lr {opt.lr:.2e}  loss {loss.item():.4f}"
-                if val_data is not None:                              # 每打印间隔报 val loss
-                    v = estimate_val_loss(model, val_data, ctx_len, val_n_batch)
+                if v is not None:                                     # 每监控节拍报 val loss
                     line += f"  val {v:.4f}"
+                if val_ratio is not None:
+                    line += f"  val_ratio {val_ratio:.4f}"
+                if acc is None:
+                    line += "  aux -"
+                else:
+                    ta, ra = acc
+                    parts = ([f"t{ta:.3f}"] if ta is not None else []) \
+                        + ([f"r{ra:.3f}"] if ra is not None else [])
+                    line += "  aux " + "/".join(parts)
                 print(line)
             if demo_every and step and step % demo_every == 0:
                 print(f"  生成: {_demo_text(model, stoi, itos, demo_prompts)}")

@@ -62,13 +62,25 @@ def test_roundtrip():
 
 
 def _tiny_corpus_dir():
-    """造 60 行小语料目录，返回 (dir, corpus_path, ckpt_path)。"""
+    """造 60 行小语料及其同源 meta，返回 (dir, corpus_path, ckpt_path, meta_path)。
+
+    train() 载入的 meta 必须与语料同长（长度不符即 AssertionError，不退化），故此处
+    按语料 token 数生成等长恒等 meta（权重全 1、辅助标签全「未覆盖」、区标全常态）。
+    """
     td = tempfile.mkdtemp()
     line = "床前明月光，疑是地上霜。举头望明月，低头思故乡。"
-    with open(os.path.join(td, "corpus.txt"), "w", encoding="utf-8") as f:
+    corpus_path = os.path.join(td, "corpus.txt")
+    with open(corpus_path, "w", encoding="utf-8") as f:
         for _ in range(60):
             f.write(line + "\n")
-    return td, os.path.join(td, "corpus.txt"), os.path.join(td, "model.npz")
+    meta_path = os.path.join(td, "meta.npz")
+    n = len(train.load_corpus(corpus_path)[4])          # 第 5 个返回值为 data
+    np.savez(meta_path,
+             weights=np.ones(n, dtype=np.float32),
+             tone_labels=np.full(n, 2, dtype=np.int8),
+             rhyme_labels=np.zeros(n, dtype=np.int16),
+             zone_tags=np.zeros(n, dtype=np.int8))
+    return td, corpus_path, os.path.join(td, "model.npz"), meta_path
 
 
 def _collect_lrs(**kw):
@@ -85,9 +97,10 @@ def test_lr_replay():
     第一段训 40 步、第二段续 20 步：拼接 lr 曲线应与从头训 60 步逐点相等。
     （旧冻结语义下第二段恒 3e-5，退火中段并非该值，故能区分新旧行为。）
     """
-    td, corpus, cp = _tiny_corpus_dir()
+    td, corpus, cp, meta_path = _tiny_corpus_dir()
     try:
-        base = dict(data_path=corpus, ckpt_path=cp, max_steps=60, anneal_total=200,
+        base = dict(data_path=corpus, meta_path=meta_path, ckpt_path=cp,
+                    max_steps=60, anneal_total=200,
                     warmup_steps=20, peak_lr=3e-4, d_model=16, n_head=2,
                     n_layer=1, ctx_len=16, batch_size=4, seed=SEED, save_every=None,
                     val_path=os.path.join(td, "no-such-val.txt"))  # 关闭 val，隔离外部文件

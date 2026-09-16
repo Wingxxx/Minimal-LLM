@@ -19,3 +19,10 @@ data/corpus-300.txt
 
 # 训练运行日志（本地运行产物，脱离权重档无独立意义）
 logs/
+
+# ── S8 格律内化：中间产物（合计 ~51MB，可由已入库物离线重建，不入库）──
+# 混合语料 mix.txt 与其 meta：由 corpus.txt + selftrain.txt 按 ρ=0.2 拼出，
+# 重建命令 `python tools/selftrain.py --stage build`（只读 data/_selftrain_raw.jsonl，
+# 不需要 GPU、不需要权重档）；语料本体 corpus.txt/val.txt 与 meta.npz 正常入库。
+data/mix.txt
+data/mix-meta.npz
