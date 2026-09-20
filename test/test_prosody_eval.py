@@ -1115,6 +1115,158 @@ def test_judge_parity_attribution_significant_aligned_higher():
     print("  相位归因判据显著支：点名该组 → 须按 §九 停手报主子复核口径 ✓")
 
 
+# ─────────── 诗体前缀口径对照（诊断；§十五 / §15.8）───────────
+
+def test_encode_tag_prefix_is_single_token():
+    """编码前提：诗体 token 前缀在 prompt 之前只占 1 个 id（tag 臂断言 len(ids)=len(prompt)+1 的依据）。"""
+    stoi = train.load_corpus()[2]
+    for tag, prompt, n in (("<五绝>", "新晴花枝下", 5), ("<七绝>", "两个黄鹂鸣翠柳", 7)):
+        ids = train.encode(tag + prompt, stoi)
+        assert len(ids) == n + 1, f"{tag}{prompt} 应编码为 {n + 1} 个 id，实为 {len(ids)}"
+        assert len(train.encode(prompt, stoi)) == n, f"{prompt} 应编码为 {n} 个 id"
+        assert int(ids[0]) >= 8196, "诗体 token 的 id 应落在纯文本字符表（8196）之后"
+    print("  诗体前缀 <五绝>/<七绝> 各计 1 个 id，其 id ≥ 8196 ✓")
+
+
+def test_generate_texts_tag_prefix_smoke():
+    """tag 臂生成通道：返回文本以「诗体 token + prompt」起头，续写长度不变。
+
+    续写长度按 token 计（诗体 token 计 1 个 id、占 4 字符，故字符数 ≠ token 数）：裸臂 =
+    prompt 5 token + 4 token 续写；tag 臂 = 诗体 token 1 + prompt 5 token + 4 token 续写。
+    """
+    model, stoi, itos = prosody_eval.load_new_model(prosody_eval.MODEL_M1)
+    pool = [("<五绝>", "新晴花枝下")]
+    bare = prosody_eval.generate_texts(model, stoi, itos, pool, new_tokens=4)
+    tag = prosody_eval.generate_texts(model, stoi, itos, pool, new_tokens=4, tag_prefix=True)
+    n_prompt = len(train.encode("新晴花枝下", stoi))
+    assert bare[0].startswith("新晴花枝下"), f"裸臂文本异常：{bare[0]!r}"
+    assert tag[0].startswith("<五绝>新晴花枝下"), f"tag 臂文本异常：{tag[0]!r}"
+    assert len(train.encode(bare[0], stoi)) == n_prompt + 4, \
+        f"裸臂续写应为 4 个 token：{bare[0]!r} → {len(train.encode(bare[0], stoi))} token"
+    assert len(train.encode(tag[0], stoi)) == 1 + n_prompt + 4, \
+        f"tag 臂续写应为 4 个 token 且前缀占 1 个 id：{tag[0]!r} → " \
+        f"{len(train.encode(tag[0], stoi))} token"
+    print(f"  裸臂 {bare[0]!r} / tag 臂 {tag[0]!r} ✓")
+
+
+def test_tag_arm_available_by_vocab():
+    """tag 臂可执行性按档内词表判定：旧档（纯文本词表 8196）不可执行，M1/M2/M3 可执行。"""
+    assert prosody_eval.tag_arm_available(prosody_eval.OLD_MODEL) is False, \
+        "旧档词表不含诗体 token，tag 臂应判不可执行"
+    for p in (prosody_eval.MODEL_M1, prosody_eval.MODEL_M2, prosody_eval.MODEL_M3):
+        assert prosody_eval.tag_arm_available(p) is True, f"{p} 词表含诗体 token，应可执行"
+    print("  旧档 tag 臂不可执行、新档可执行 ✓")
+
+
+def test_tag_arm_kinds_splits_by_vocab():
+    """待跑组按可执行性二分：旧档入 skipped，其余入 runnable；各自保持入参顺序。"""
+    runnable, skipped = prosody_eval.tag_arm_kinds(["old", "m1", "m2", "m3", "m3_cons"])
+    assert runnable == ["m1", "m2", "m3", "m3_cons"], f"可执行组异常：{runnable}"
+    assert skipped == ["old"], f"应仅旧档不可执行：{skipped}"
+    print("  分组过滤：old → skipped，其余 → runnable ✓")
+
+
+def test_run_group_records_tag_prefix():
+    """run_group 透传 tag_prefix 并在结果字典内如实记录（供第九节取用）；两臂均可跑通。"""
+    pool = prosody_eval.read_pool_file(prosody_eval.POOL_PATH)[:2]
+    bare = prosody_eval.run_group("old", pool, new_tokens=4)
+    assert bare["tag_prefix"] is False and bare["n"] == 2, \
+        f"裸臂结果异常：tag_prefix={bare.get('tag_prefix')} n={bare['n']}"
+    tag = prosody_eval.run_group("m1", pool, new_tokens=4, tag_prefix=True)
+    assert tag["tag_prefix"] is True and tag["n"] == 2, \
+        f"tag 臂结果异常：tag_prefix={tag.get('tag_prefix')} n={tag['n']}"
+    print("  run_group 记录 tag_prefix：裸臂 False / tag 臂 True ✓")
+
+
+def test_tag_arm_section_totals_and_diff_recomputable():
+    """第九节两臂总表：差值 = tag 臂 − 裸臂（百分点），可由行内两臂值复算（误差 ≤ 0.01pp）。"""
+    bare = {"m1": _fake_group("m1", "M1 模型（约束关）", 0.52, 0.0674, 0.9152)}
+    tag = {"m1": _fake_group("m1", "M1 模型（约束关）", 0.96, 0.068, 0.93)}
+    text = "\n".join(prosody_eval.tag_arm_section(bare, tag))
+    for want in ("+44.00", "+0.06", "+1.48"):
+        assert want in text, f"两臂差值应含 {want}：{text}"
+    assert "裸臂 52.00%" in text and "tag 臂 96.00%" in text, f"两臂绝对值缺失：{text}"
+    print("  第九节两臂总表差值可复算 ✓")
+
+
+def test_tag_arm_section_per_tag_threshold_note():
+    """逐诗体明细：n < 30 者标注「不作判据」，n ≥ 30 者不标。"""
+    bare = {"m1": _fake_group("m1", "M1 模型（约束关）", 0.52, 0.07, 0.91, n=80)}
+    tag = {"m1": _fake_group("m1", "M1 模型（约束关）", 0.96, 0.07, 0.93, n=80)}
+    text = "\n".join(prosody_eval.tag_arm_section(bare, tag))
+    assert "n=20" in text and "（n < 30，不作判据）" in text, f"小样本须标注：{text}"
+    bare2 = {"m1": _fake_group("m1", "M1 模型（约束关）", 0.52, 0.07, 0.91)}
+    tag2 = {"m1": _fake_group("m1", "M1 模型（约束关）", 0.96, 0.07, 0.93)}
+    text2 = "\n".join(prosody_eval.tag_arm_section(bare2, tag2))
+    assert "n=40" in text2 and "不作判据" not in text2, f"大样本不应标注：{text2}"
+    print("  逐诗体明细小样本标注正确 ✓")
+
+
+def test_tag_arm_section_skipped_is_annotated():
+    """tag 臂不可执行的组如实留空并注明，且不得输出任何对照数字（防伪对照）。"""
+    bare = {"old": _fake_group("old", "旧模型 model.npz（约束关）", 0.70, 0.55, 0.50)}
+    text = "\n".join(prosody_eval.tag_arm_section(bare, {}, skipped=("old",)))
+    assert "不可执行" in text and "留空" in text, f"不可执行组须如实注明：{text}"
+    assert "70.00%" not in text, f"不可执行的组不得输出对照数字（防伪对照）：{text}"
+    print("  不可执行组如实留空、无伪对照 ✓")
+
+
+def test_tag_arm_section_answers_two_questions():
+    """直答两问取值出自实算：①句长是否 ≥ 95%；②押韵是否仍落在 6–8% 区间。"""
+    bare = {"m1": _fake_group("m1", "M1 模型（约束关）", 0.5209, 0.0674, 0.9152)}
+    low = {"m1": _fake_group("m1", "M1 模型（约束关）", 0.9000, 0.0680, 0.9300)}
+    high = {"m1": _fake_group("m1", "M1 模型（约束关）", 0.9700, 0.1500, 0.9300)}
+    t1 = "\n".join(prosody_eval.tag_arm_section(bare, low))
+    assert "是否 ≥ 95%：否" in t1 and "是否仍落在 6%–8% 区间（即无实质提升）：是" in t1, t1
+    t2 = "\n".join(prosody_eval.tag_arm_section(bare, high))
+    assert "是否 ≥ 95%：是" in t2 and "是否仍落在 6%–8% 区间（即无实质提升）：否" in t2, t2
+    print("  直答两问取值出自实算 ✓")
+
+
+def test_tag_arm_section_declares_redline():
+    """第九节须含红线声明：不替换/不改闸门口径/不重判 M1 + §十四 实测缺口引用。"""
+    text = "\n".join(prosody_eval.tag_arm_section({}, {}))
+    for key in ("绝不替换", "绝不修改闸门口径", "绝不用以重判 M1", "6.93%", "65.78%", "58.85"):
+        assert key in text, f"第九节缺少红线声明要素：{key}"
+    print("  第九节红线声明齐备 ✓")
+
+
+def test_write_report_tag_arm_appends_only():
+    """接入第九节后，报告第一至八节与仅裸臂时逐字节一致（零漂移）；第九节为纯追加。"""
+    d = _mkprobe()
+    meta = {"pool_path": "data/eval-prompts.txt", "val_path": "data/val.txt", "seed": 0,
+            "new_tokens": 96, "temperature": 1.0, "top_k": 20, "n_per_tag": 40,
+            "per_tag_n": {tag: 40 for tag in POOL_TAGS}, "device": "numpy"}
+    bare = {"old": _fake_group("old", "旧模型 model.npz（约束关）", 0.484, 0.0779, 0.8635),
+            "m1": _fake_group("m1", "M1 模型（约束关）", 0.5209, 0.0674, 0.9152)}
+    tag = {"m1": _fake_group("m1", "M1 模型（约束关）", 0.9100, 0.0690, 0.9300)}
+    p1 = os.path.join(d, "ab-bare-only.txt")
+    p2 = os.path.join(d, "ab-both-arms.txt")
+    prosody_eval.write_report(bare, p1, meta)
+    prosody_eval.write_report(bare, p2, meta, tag_results=tag, tag_skipped=("old",))
+    with open(p1, encoding="utf-8") as f:
+        a = f.read()
+    with open(p2, encoding="utf-8") as f:
+        b = f.read()
+    assert "九、" not in a, "仅裸臂时不得出现第九节"
+    assert b.startswith(a), "第九节必须为纯追加，第一至八节不得有任何改动（零漂移）"
+    assert "九、诗体前缀口径对照" in b[len(a):], "新增内容应为第九节"
+    print("  第九节纯追加、前八节零漂移 ✓")
+
+
+def test_parse_arms():
+    """--arms 解析：裸臂必备、去重保序、非法值响亮失败。"""
+    assert prosody_eval.parse_arms("bare,tag") == ("bare", "tag")
+    assert prosody_eval.parse_arms(" tag , bare , tag ") == ("tag", "bare")
+    for bad in ("", "   ", "tag", "bare,tag,xxx"):
+        try:
+            prosody_eval.parse_arms(bad)
+        except AssertionError:
+            continue
+        raise AssertionError(f"--arms={bad!r} 应报错（非法或省略裸臂）")
+    print("  --arms 解析与非法值防呆 ✓")
+
+
 def _run(fn):
     """执行单项测试并把断言失败转为 ✗ 记录，返回是否通过。"""
     try:
@@ -1155,6 +1307,18 @@ TESTS = (
     test_write_report_parity_disclosure,
     test_judge_parity_attribution_not_significant,
     test_judge_parity_attribution_significant_aligned_higher,
+    test_encode_tag_prefix_is_single_token,
+    test_generate_texts_tag_prefix_smoke,
+    test_tag_arm_available_by_vocab,
+    test_tag_arm_kinds_splits_by_vocab,
+    test_run_group_records_tag_prefix,
+    test_tag_arm_section_totals_and_diff_recomputable,
+    test_tag_arm_section_per_tag_threshold_note,
+    test_tag_arm_section_skipped_is_annotated,
+    test_tag_arm_section_answers_two_questions,
+    test_tag_arm_section_declares_redline,
+    test_write_report_tag_arm_appends_only,
+    test_parse_arms,
 )
 
 

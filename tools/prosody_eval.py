@@ -135,6 +135,11 @@ AB_GROUPS = (("1", "old", "旧模型", "关"),
              ("3", "m3_cons", "新 M3 模型", "开"))
 _AB_NO = {kind: no for no, kind, _, _ in AB_GROUPS}
 
+# tag 臂不可执行时的报告措辞（§15.8 死规则）：被过滤的组不生成、不评分、不出数，如实留空并注明
+TAG_ARM_UNAVAILABLE_NOTE = (
+    "tag 臂不可执行（档内词表不含诗体 token：旧档为剥去诗体标签的纯文本字符表，"
+    "train.encode 会把「<诗体>」前缀按词表外字符逐个跳过），如实留空、不编造")
+
 _VOCAB = None      # 当前语料词表缓存：(chars, stoi, itos)
 _CORPUS_CACHE = {}  # corpus_path -> 全文缓存（同一路径整轮只读盘一次，供碰撞判定复用）
 _POOL_STATS = None  # 最近一次构建/复用 prompt 池的碰撞排除统计（两条路径皆写回，供报告取用）
@@ -607,13 +612,41 @@ def load_new_model(path, n_rhyme=None, use_tone=None):
     return model, stoi, itos
 
 
+def tag_arm_available(path):
+    """该档能否执行 tag 臂：只读档内词表（_chars 项数与 tok_emb 行数），不载权重。
+
+    档内词表若只覆盖纯文本字符表（旧档 8196 项），encode 会静默跳过「<诗体>」前缀，两臂将
+    退化为同一份输出——故判为不可执行、由报告如实留空，严禁给出伪对照。新档词表在纯文本字符表
+    之后追加了 5 个诗体 token（8196 + 5 = 8201），故可执行。
+    """
+    d = onp.load(path)
+    return int(d["tok_emb"].shape[0]) == len(d["_chars"]) + len(train.SPECIAL_TOKENS)
+
+
+def tag_arm_kinds(kinds):
+    """把待跑组按「tag 臂可否执行」二分，返回 (runnable, skipped)，各自保持入参顺序。"""
+    runnable, skipped = [], []
+    for kind in kinds:
+        path = GROUP_SPECS[kind][0]
+        if os.path.exists(path) and tag_arm_available(path):
+            runnable.append(kind)
+        else:
+            skipped.append(kind)
+    return runnable, skipped
+
+
 # ─────────────────────────────── 生成与打分 ───────────────────────────────
 
-def generate_texts(model, stoi, itos, pool, new_tokens=NEW_TOKENS, constraint_on=False):
-    """对 prompt 池逐条续写，返回生成文本列表（prompt + 续写）。
+def generate_texts(model, stoi, itos, pool, new_tokens=NEW_TOKENS, constraint_on=False,
+                   tag_prefix=False):
+    """对 prompt 池逐条续写，返回生成文本列表。
 
     生成前复位随机源，使各组从同一采样流出发。constraint_on=True 时挂载句长约束处理器
     （每 prompt 独立处理器，句长在首次调用时按 prompt 推断并冻结）。
+
+    tag_prefix=True 时把该 prompt 所属诗体 token 拼在 prompt **之前**（如「<五绝>新晴花枝下」），
+    用于诊断臂——模型由此得知诗体；返回文本含该前缀（与模型所见逐字一致），因四项指标全部
+    尾锚，前缀不影响评分口径。裸臂（False）分支与加前缀前逐字一致。
     """
     set_seed(SEED)
     punct_ids = non_hanzi_ids = newline_id = None
@@ -624,8 +657,13 @@ def generate_texts(model, stoi, itos, pool, new_tokens=NEW_TOKENS, constraint_on
         newline_id = stoi.get("\n")
     texts = []
     for tag, prompt in pool:
-        ids = onp.asarray(train.encode(prompt, stoi))
-        assert len(ids) == len(prompt), f"prompt 含词表外字符或特殊 token：{prompt!r}"
+        head = tag + prompt if tag_prefix else prompt
+        ids = onp.asarray(train.encode(head, stoi))
+        if tag_prefix:
+            assert len(ids) == len(prompt) + 1, (
+                f"tag 臂编码长度应为 prompt 字数 + 1（诗体 token 计 1 个 id）：{head!r} → {len(ids)}")
+        else:
+            assert len(ids) == len(prompt), f"prompt 含词表外字符或特殊 token：{prompt!r}"
         processor = None
         if constraint_on:
             processor = meter.make_meter_processor(
@@ -634,7 +672,7 @@ def generate_texts(model, stoi, itos, pool, new_tokens=NEW_TOKENS, constraint_on
         out = model.generate(np.asarray(ids[None, :]), new_tokens, temperature=TEMPERATURE,
                              top_k=TOP_K, logits_processor=processor)
         gen = as_numpy(out[0])[len(ids):]
-        texts.append(prompt + "".join(itos[int(i)] for i in gen))
+        texts.append(head + "".join(itos[int(i)] for i in gen))
     return texts
 
 
@@ -772,11 +810,14 @@ def assert_same_device(devices):
     assert len(uniq) <= 1, f"A/B 各组计算设备不一致：{devices}（须在同一设备上跑）"
 
 
-def run_group(kind, pool, constraint_on=None, new_tokens=NEW_TOKENS):
-    """跑一组：载入模型 → 生成 → 打分 + 按相位拆分押韵，返回结果字典（含设备、标签、约束开关）。
+def run_group(kind, pool, constraint_on=None, new_tokens=NEW_TOKENS, tag_prefix=False):
+    """跑一组：载入模型 → 生成 → 打分 + 按相位拆分押韵，返回结果字典（含设备、标签、约束开关、
+    是否加诗体前缀）。
 
     相位拆分（§8.2 死规则 2026-09-15）一律取自本轮**已生成文本**（generate_texts 的返回值，
     不额外生成、不改抽样口径），随结果落进 rhyme_by_parity 供报告取用。
+    tag_prefix=True 即 tag 臂：prompt 前拼诗体 token（由 generate_texts 负责），结果字典内如实
+    记录该开关（tag_prefix 字段），供报告第九节区分两臂。
     """
     assert kind in GROUP_SPECS, f"未知分组 {kind}"
     path, spec_constraint, label = GROUP_SPECS[kind]
@@ -787,11 +828,11 @@ def run_group(kind, pool, constraint_on=None, new_tokens=NEW_TOKENS):
         model, stoi, itos = load_old_model(path)
     else:
         model, stoi, itos = load_new_model(path)
-    texts = generate_texts(model, stoi, itos, pool, new_tokens, constraint_on)
+    texts = generate_texts(model, stoi, itos, pool, new_tokens, constraint_on, tag_prefix)
     res = score_group(texts, pool)
     res["rhyme_by_parity"] = split_rhyme_by_parity(texts, pool)
     res.update(kind=kind, model_path=path, constraint=constraint_on,
-               device=np.__name__, label=label)
+               device=np.__name__, label=label, tag_prefix=tag_prefix)
     return res
 
 
@@ -906,24 +947,44 @@ def judge_parity_attribution(results):
             "facts": facts, "lines": lines}
 
 
-def run_eval(pool, kinds=None, new_tokens=NEW_TOKENS, report_path=REPORT_PATH, pool_stats=None):
+def run_arm(kinds, pool, new_tokens, tag_prefix):
+    """跑一臂的全部组：逐组载入 → 生成 → 打分，返回 ({组名: 结果}, [设备...])。
+
+    每组生成前由 generate_texts 复位随机源，故「先裸臂后 tag 臂」与「只跑裸臂」的裸臂结果一致。
+    """
+    results, devices = {}, []
+    for kind in kinds:
+        res = run_group(kind, pool, new_tokens=new_tokens, tag_prefix=tag_prefix)
+        results[kind] = res
+        devices.append(res["device"])
+        o = res["overall"]
+        print(f"[评估{'·tag' if tag_prefix else ''}] {res['label']}：样本 {res['n']} | "
+              f"句长 {_pct(o['line_len'])} 押韵 {_pct(o['rhyme'])} "
+              f"首句入韵 {_pct(o['first_rhyme'])} 平仄 {_pct(o['tone'])} | "
+              f"孤平 {o['gu_ping']} 三平调 {o['san_ping']}")
+    return results, devices
+
+
+def run_eval(pool, kinds=None, new_tokens=NEW_TOKENS, report_path=REPORT_PATH, pool_stats=None,
+             arms=("bare",)):
     """执行全部分组评估、断言同设备、写盘中文报告，返回 {组名: 结果}。
 
     pool_stats 为 prompt 池的碰撞排除统计（prosody_eval.pool_exclusion_stats()；复用落盘池时
     亦由 build_eval_pool 重算写回，非 None），随 meta 传入写盘函数，供报告如实写明实际排除条数
     与排除后逐诗体样本量。meta 另附 half_parity = half_parity_stats(pool)（池内 prompt 取自
     原诗半句位的奇偶分布，实算），供报告第七节披露押韵对齐代价。
+
+    arms 为臂名序列（取值 bare / tag）：裸臂必跑（报告第一至八节的唯一数据来源），tag 臂仅在
+    arms 含 "tag" 时追加——待跑组先由 tag_arm_kinds 按档内词表过滤（不可执行者不生成、不评分），
+    返回值仍是**裸臂**结果字典（向后兼容）；同设备断言覆盖两臂全部组。
     """
     kinds = kinds if kinds is not None else default_kinds()
-    results, devices = {}, []
-    for kind in kinds:
-        res = run_group(kind, pool, new_tokens=new_tokens)
-        results[kind] = res
-        devices.append(res["device"])
-        o = res["overall"]
-        print(f"[评估] {res['label']}：样本 {res['n']} | 句长 {_pct(o['line_len'])} "
-              f"押韵 {_pct(o['rhyme'])} 首句入韵 {_pct(o['first_rhyme'])} "
-              f"平仄 {_pct(o['tone'])} | 孤平 {o['gu_ping']} 三平调 {o['san_ping']}")
+    results, devices = run_arm(kinds, pool, new_tokens, tag_prefix=False)
+    tag_results, tag_skipped = None, ()
+    if "tag" in arms:
+        runnable, tag_skipped = tag_arm_kinds(kinds)
+        tag_results, tag_devices = run_arm(runnable, pool, new_tokens, tag_prefix=True)
+        devices += tag_devices
     assert_same_device(devices)
     # 终端同屏打印押韵口径相位披露的两组实算（报告为准）：真诗同口径上限 + 各组按相位拆分。
     ceil = real_poem_ceiling_stats(pool)
@@ -944,7 +1005,7 @@ def run_eval(pool, kinds=None, new_tokens=NEW_TOKENS, report_path=REPORT_PATH, p
             "new_tokens": new_tokens, "temperature": TEMPERATURE, "top_k": TOP_K,
             "n_per_tag": N_PER_TAG, "per_tag_n": per_tag_n, "device": devices[0],
             "pool_stats": pool_stats, "half_parity": half_parity_stats(pool)}
-    write_report(results, report_path, meta)
+    write_report(results, report_path, meta, tag_results=tag_results, tag_skipped=tuple(tag_skipped))
     print(f"[报告] 已写入 {report_path}")
     return results
 
@@ -961,6 +1022,92 @@ def _pm(rate, halfwidth):
     return f"{_pct(rate)}±{_pct(halfwidth)}"
 
 
+ARMS = ("bare", "tag")                     # 评估臂：裸臂（基线）/ tag 臂（诊断）
+TAG_ARM_METRICS = (("line_len", "句长"), ("rhyme", "押韵"), ("tone", "平仄"))
+TAG_ARM_RHYME_BAND = (0.06, 0.08)          # 第二问判据带：§十四 M1 裸臂押韵实测 6.74% 所在量级
+TAG_ARM_REDLINE = (
+    "本节的 tag 臂仅作诊断对照，绝不替换、绝不修改闸门口径，绝不用以重判 M1；§十四 的闸门结论与"
+    "全部阈值继续有效，本步不作任何改动。押韵在「对齐子集」上实测 6.93%、真诗同口径基准 65.78%"
+    "（差 -58.85 个百分点，见第八节），已实证为真实缺陷，不得以取样口径为由改判。")
+
+
+def _pp(x):
+    """把两个比例之差格式化为带符号的百分点文本（如 +44.00）。"""
+    return f"{x * 100.0:+.2f}"
+
+
+def _threshold_pct(x):
+    """把阈值格式化为整数百分点文本（如 95%），供直答问句使用。"""
+    return f"{x * 100.0:.0f}%"
+
+
+def _tag_arm_answers(bare, tag):
+    """直答两问的正文行：① tag 臂 M1 句长是否 ≥ M1_MIN_LINE_LEN；② 押韵是否仍落在
+    TAG_ARM_RHYME_BAND。缺任一侧数据时如实留空、不编造。"""
+    if "m1" not in bare or "m1" not in tag:
+        return ["     M1 组在某一臂缺数据，两问如实留空、不编造。"]
+    b, t = bare["m1"]["overall"], tag["m1"]["overall"]
+    lo, hi = TAG_ARM_RHYME_BAND
+    q1 = "是" if t["line_len"] >= M1_MIN_LINE_LEN else "否"
+    q2 = "是" if lo <= t["rhyme"] <= hi else "否"
+    return [
+        f"     ① tag 臂 M1 句长 {_pct(t['line_len'])}（裸臂 {_pct(b['line_len'])}，"
+        f"差值 {_pp(t['line_len'] - b['line_len'])} 个百分点）"
+        f"是否 ≥ {_threshold_pct(M1_MIN_LINE_LEN)}：{q1}",
+        f"     ② tag 臂 M1 押韵 {_pct(t['rhyme'])}（裸臂 {_pct(b['rhyme'])}，"
+        f"差值 {_pp(t['rhyme'] - b['rhyme'])} 个百分点）是否仍落在 "
+        f"{_threshold_pct(lo)}–{_threshold_pct(hi)} 区间（即无实质提升）：{q2}",
+    ]
+
+
+def tag_arm_section(bare, tag, skipped=()):
+    """生成报告第九节的正文行（纯函数，供单测直接复算；不含节标题）。
+
+    逐组给 句长/押韵/平仄 的「裸臂值 / tag 臂值 / 差值（百分点）」，差值一律 = tag 臂 − 裸臂；
+    skipped 中的组如实注明不可执行、不输出任何对照数字。所有数字一律取自入参结果字典，不写死。
+    """
+    lo, hi = TAG_ARM_RHYME_BAND
+    L = ["  1. 两臂定义与同源约束：",
+         "     裸臂 = prompt 原文（与第一至八节口径逐字一致）；tag 臂 = 该 prompt 所属诗体 token"
+         "前缀 + prompt（如「<五绝>新晴花枝下」）。",
+         "     同源：同一 prompt 池 / 同一 SEED / 同一 new_tokens / 同一 temperature·top_k / 同一设备；"
+         "池、碰撞排除、分层抽样、闸门阈值一律未动。",
+         "     评分口径：两臂共用 prosody.py 既有评分函数，一行未改；四项指标全部尾锚"
+         "（句长 _trailing_hanzi、平仄 seg[-n:]、押韵 s[-1]、首句入韵 segs[0][-1]），"
+         "诗体 token 位于半句首部（「<」「>」非汉字），故对四项指标无影响。",
+         f"  2. 两臂各组总表（差值 = tag 臂 − 裸臂，单位：个百分点；"
+         f"比例指标附 95% 置信区间半宽；押韵参考带 {_threshold_pct(lo)}–{_threshold_pct(hi)}）："]
+    for kind, res in bare.items():
+        label = res["label"]
+        if kind in skipped:
+            L.append(f"     {label}：{TAG_ARM_UNAVAILABLE_NOTE}")
+            continue
+        if kind not in tag:
+            L.append(f"     {label}：本轮 tag 臂无该组数据，如实留空、不编造。")
+            continue
+        for key, name in TAG_ARM_METRICS:
+            b, tv = res["overall"][key], tag[kind]["overall"][key]
+            bci, tci = res["overall"]["ci"][key], tag[kind]["overall"]["ci"][key]
+            L.append(f"     {label} {name}：裸臂 {_pct(b)}±{_pct(bci)} / "
+                     f"tag 臂 {_pct(tv)}±{_pct(tci)} / 差值 {_pp(tv - b)} 个百分点")
+    L.append("  3. 逐诗体明细（n 为该诗体样本量；n < 30 者不作为判据；"
+             "差值 = tag 臂 − 裸臂，单位：百分点）：")
+    for kind, res in bare.items():
+        if kind in skipped or kind not in tag:
+            continue
+        for tg in POOL_TAGS:
+            b, t = res["per_tag"][tg], tag[kind]["per_tag"][tg]
+            note = "（n < 30，不作判据）" if b["n"] < MIN_SAMPLES_PER_TAG else ""
+            cells = " ".join(
+                f"{name} 裸臂 {_pct(b[key])} / tag 臂 {_pct(t[key])} / 差值 {_pp(t[key] - b[key])}"
+                for key, name in TAG_ARM_METRICS)
+            L.append(f"     {res['label']} {tg} n={b['n']} {cells}{note}")
+    L.append("  4. 直答两问（取值一律出自本节第 2、3 条实算，不外推）：")
+    L.extend(_tag_arm_answers(bare, tag))
+    L.append(f"  5. 红线声明：{TAG_ARM_REDLINE}")
+    return L
+
+
 def _samples_ok(meta):
     """样本量是否满足硬下限（每诗体 ≥ 30 且 合计 ≥ 120）。"""
     n = meta["per_tag_n"]
@@ -968,7 +1115,7 @@ def _samples_ok(meta):
         and sum(n.values()) >= MIN_SAMPLES_TOTAL
 
 
-def write_report(results, path, meta):
+def write_report(results, path, meta, tag_results=None, tag_skipped=()):
     """把评估结果写盘为中文报告，返回路径。
 
     报告固定包含：生成口径（含碰撞排除的实际排除条数与排除后逐诗体供给量）、各组指标
@@ -978,6 +1125,9 @@ def write_report(results, path, meta):
     的实算数字——数字一律由 corpus_tag_lead_stats / poem_token_len_stats / half_parity_stats 实算，
     不写死字面量）。
     M3 档未就绪时第 2、3 组标注「待 M3」并留空，区分度自检标注「未自检」，一律不编造数字。
+    tag_results 非 None 时（tag 臂已跑）在第八节之后**纯追加**第九节「诗体前缀口径对照」
+    （由 tag_arm_section 渲染，tag_skipped 中的组如实注明 tag 臂不可执行）；为 None 时第一至八节
+    逐字节不变。
     """
     L = []
     A = L.append
@@ -1214,10 +1364,27 @@ def write_report(results, path, meta):
             A(f"     {ln}")
     else:
         A(f"  3. 判据未检：{par['reason']}；本轮不得据此判定相位归因，如实留空、不编造。")
+    if tag_results is not None:
+        A("九、诗体前缀口径对照（诊断；2026-09-16 主子准行甲案：本步不改闸门口径、不重判 M1）")
+        for ln in tag_arm_section(results, tag_results, tag_skipped):
+            A(ln)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(L) + "\n")
     return path
+
+
+def parse_arms(text):
+    """解析 --arms：逗号分隔的臂名序列，去空白、去重保序；空序列、非法臂名、缺裸臂一律响亮失败。
+
+    裸臂是报告第一至八节的唯一数据来源，故不可省略（省去即无法做「零漂移」自证）。
+    """
+    arms = tuple(dict.fromkeys(a.strip() for a in text.split(",") if a.strip()))
+    assert arms, "--arms 不得为空（取值 bare / tag）"
+    bad = [a for a in arms if a not in ARMS]
+    assert not bad, f"未知臂名 {bad}（取值 {' / '.join(ARMS)}）"
+    assert "bare" in arms, "裸臂是报告第一至八节的唯一数据来源，不可省略"
+    return arms
 
 
 def main(argv=None):
@@ -1230,15 +1397,19 @@ def main(argv=None):
     ap.add_argument("--n-per-tag", type=int, default=N_PER_TAG, help="每诗体 prompt 条数")
     ap.add_argument("--new-tokens", type=int, default=NEW_TOKENS, help="每首续写 token 数")
     ap.add_argument("--report", default=REPORT_PATH, help="报告落盘路径")
+    ap.add_argument("--arms", default="bare,tag",
+                    help="评估臂（逗号分隔，取值 bare / tag）；默认两臂全跑作口径对照")
     args = ap.parse_args(argv)
 
     pool = build_eval_pool(n_per_tag=args.n_per_tag)
     pool = take_per_tag(pool, args.limit)
     kinds = args.models.split(",") if args.models else default_kinds()
+    arms = parse_arms(args.arms)
+    print(f"[臂] {' + '.join(arms)}")
     print(f"[池] {len(pool)} 条（" + "、".join(
         f"{t} {sum(1 for x, _ in pool if x == t)}" for t in POOL_TAGS) + "）")
     run_eval(pool, kinds, new_tokens=args.new_tokens, report_path=args.report,
-             pool_stats=pool_exclusion_stats())
+             pool_stats=pool_exclusion_stats(), arms=arms)
     return 0
 
 
