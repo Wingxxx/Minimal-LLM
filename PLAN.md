@@ -1008,314 +1008,201 @@ Run: `git add train.py test/test_train.py; git commit -m "T5: 训练循环（手
 
 ---
 
-### Task 6: server.py —— HTTP 推理服务（连续批处理 + KV Cache + SSE 流式 + p99）
+### Task 6: server.py —— HTTP 推理服务（KV Cache 增量解码 + SSE 流式 + p99）
 
-**教学主线:** 把训练好的模型变成「服务」。请求怎么排队攒批（连续批处理）、decode 怎么共享一次前向（Batcher）、怎么逐 token 推给客户端（SSE）、怎么量延迟（p99）——4 个概念层层落地。
+> **本节于 2026-09-16 就地重写，旧版全部废止。** 旧版写于 T0 之前，其前提与现状不符：假设词表 2577 项、`load_corpus()` 返回 5 元组、`GPT(vocab_size=len(chars))` 直接装配；现状为词表 **8201** 项（纯文本 8196 + 5 个诗体 token）、`load_corpus()` 返回 **6 元组**、里程碑档须按 `n_rhyme` / `use_tone` 装配。更关键的是旧版 `Batcher` 在独立线程内直调 `model.forward`，而 `forward` 会写实例属性 `self.logits` / `self.x_cache`——与 prefill 并发时构成**数据竞争**，属设计缺陷。
+>
+> 经主子 2026-09-16 准行**甲案（教学级：能跑通、好读、无竞态）**，本节重写如下。
+
+**教学主线:** 把训练好的模型变成「服务」。请求怎么排队、decode 怎么靠 KV Cache 每步只算 1 个 token、怎么逐 token 推给客户端（SSE）、怎么量延迟（p99）——4 个概念层层落地。
+
+**范围（主子 2026-09-16 定档，严守边界）**
+
+| 类别 | 内容 |
+| --- | --- |
+| **做** | `server.py`：单推理线程串行调度 + KV Cache 增量解码 + 非流式/SSE 流式 + `/stats` 延迟统计（count/avg/p50/p99）+ 两个可选开关（`style` 诗体、`enforce_meter` 句长约束） |
+| **不做** | `cli.py`（本轮范围外）、连续批处理攒批（Batcher）、BoN 格律选优、鉴权、请求持久化日志 |
 
 **Files:**
 - Create: `server.py`
 - Create: `test/test_server.py`
+- Modify: `model/gpt.py`（`GPT.generate` 增可选参数 `on_token=None`；默认 None 时行为逐位不变）
+- Modify: `README.md`（删去「Task 6/7 未实现、不在本仓库范围内」的声明；目录结构补 `server.py`）
+- Modify: `PLAN.md`（本节重写）
 
-- [ ] **S1 讲解服务架构（先看全局）**
-  - `ThreadingHTTPServer`：每个 HTTP 请求一个线程，天然支持并发
-  - 主路径：请求 → `InferenceEngine.complete()` → prefill（一次完整前向建 KV Cache）→ 循环 decode（每步经 Batcher 组批）→ 采样 → 返回
-  - SSE 流式：响应头 `text/event-stream`，每个 token 一条 `data: {...}\n\n`，最后 `data: [DONE]`
-  - 非流式：攒完整段文本一次性 JSON 返回
+#### 6.1 架构与线程模型
 
-- [ ] **S2 讲解连续批处理调度器（Batcher）核心思想**
-  - 问题：单请求 decode 时计算利用率低——每个请求只算 1 个 token 的 1 次前向
-  - 思想：把多个请求的同一 decode 步「攒」在一起，`[B,1,V]` 一次前向 = B 个请求共享
-  - 触发条件：`满批（len>=max_batch）` 或 `超时（max_wait）`——满批保吞吐，超时保延迟
-  - 难点：不同请求的 cache 长度可能不同 → 按 `Tk` 长度分组，各组分别前向
-  - 这是 8-07「连续批处理」/ 8-11「推理服务设计」的直接落地
-
-- [ ] **S3 实现 `Batcher`（队列 + 双触发 + 分组前向）**
-
-```python
-class Batcher:
-    """连续批处理调度器：多个请求的 decode 步攒批，共享一次模型前向"""
-
-    def __init__(self, model, max_batch=4, max_wait=0.02):
-        self.model = model
-        self.max_batch = max_batch
-        self.max_wait = max_wait
-        self.cond = threading.Condition()
-        self.queue = []
-        threading.Thread(target=self._loop, daemon=True).start()
-
-    def _loop(self):
-        while True:
-            with self.cond:
-                while not self.queue:
-                    self.cond.wait()
-                deadline = time.time() + self.max_wait
-                while len(self.queue) < self.max_batch:
-                    remaining = deadline - time.time()
-                    if remaining <= 0:
-                        break
-                    self.cond.wait(remaining)
-                batch = self.queue
-                self.queue = []
-            self._forward(batch)
-            with self.cond:
-                for req in batch:
-                    req['result'] = req['_result']
-                    req['_result'] = None
-                self.cond.notify_all()
-
-    def _forward(self, batch):
-        # 不同请求的 cache 长度（Tk）可能不同，按长度分组后分别组批前向
-        groups = {}
-        for r in batch:
-            groups.setdefault(r['kvcache'][0][0].shape[2], []).append(r)
-        for g in groups.values():
-            self._forward_group(g)
-
-    def _forward_group(self, batch):
-        xs = np.concatenate([r['ids'] for r in batch], axis=0)      # [B,1]
-        n_layer = self.model.n_layer
-        kvc = [None] * n_layer
-        for i in range(n_layer):
-            ks = np.concatenate([r['kvcache'][i][0] for r in batch], axis=0)
-            vs = np.concatenate([r['kvcache'][i][1] for r in batch], axis=0)
-            kvc[i] = [ks, vs]
-        logits = self.model.forward(xs, kvc)                        # [B,1,V]
-        for j, r in enumerate(batch):
-            r['_result'] = logits[j:j + 1]
-            for i in range(n_layer):
-                r['kvcache'][i][0] = kvc[i][0][j:j + 1]
-                r['kvcache'][i][1] = kvc[i][1][j:j + 1]
-
-    def next(self, req):
-        with self.cond:
-            self.queue.append(req)
-            self.cond.notify_all()
-        with self.cond:
-            while req.get('result') is None:
-                self.cond.wait()
-            r = req['result']
-            req['result'] = None
-            return r
+```
+HTTP 线程（ThreadingHTTPServer，每请求一线程）
+   │  ① 参数校验 → ② 诗体前缀拼接 → ③ 分词 → ④ 构造格律处理器 → ⑤ 入队
+   ▼
+queue.Queue（请求队列）
+   ▼
+推理线程（全局唯一，串行消费，独占模型）
+   │  model.generate(...)   ← 传 on_token 时逐 token 回推
+   ▼
+结果回填 + Event.set() → HTTP 线程醒来写响应
 ```
 
-- [ ] **S4 讲解并实现 `InferenceEngine` + `Tracker`（p99 统计）**
-  - `InferenceEngine.complete()`：prompt → 分词 → prefill（全序列前向，把每层 KV 都填进 cache）→ 循环：取最后一个 token 交给 Batcher 组批 decode → 采样 → 拼接
-  - 关键分工：**prefill 自己算（只一次），decode 全部走 Batcher（共享）**
-  - `Tracker`：记录每次请求耗时，环形缓冲只留最近 cap 条，`summary()` 输出 count/avg_ms/p50_ms/p99_ms
+**为什么必须单推理线程**：`GPT.forward` 计算途中会把中间量写入实例属性（`self.logits`、`self.x_cache`、`self.tone_logits`、`self.rhyme_logits`），两个线程同时调用会互相覆盖。**「模型只有一个主人」是本节最核心的设计约束**，也是旧版 `Batcher` 的失效根因。
 
-```python
-class InferenceEngine:
-    """prefill 独立 + decode 经 Batcher 组批；对外 complete()"""
+**HTTP 线程绝不触碰模型**：校验、拼接、分词（只读 `stoi`）、构造处理器均为纯 CPU 只读操作，与模型零交互；只有 `model.generate` 进推理线程。
 
-    def __init__(self, gpt, stoi, itos, max_batch=4, max_wait=0.02):
-        self.gpt = gpt
-        self.stoi, self.itos = stoi, itos
-        self.batcher = Batcher(gpt, max_batch, max_wait)
-        self.head_dim = gpt.d_model // gpt.n_head
+#### 6.2 接口契约
 
-    def tokenize(self, prompt):
-        ids = [self.stoi[c] for c in prompt if c in self.stoi]
-        if not ids:
-            ids = [self.stoi['\n']]
-        return np.array([ids], dtype=np.int64)
+**`POST /v1/completions`** 请求体（除 `prompt` 外全部可选）：
 
-    def prefill(self, idx):
-        kvc = [[np.zeros((1, self.gpt.n_head, 0, self.head_dim)),
-                np.zeros((1, self.gpt.n_head, 0, self.head_dim))]
-               for _ in range(self.gpt.n_layer)]
-        self.gpt.forward(idx, kvc)
-        return kvc
-
-    def complete(self, prompt, max_tokens=32, temperature=0.8, top_k=20, top_p=None, on_token=None):
-        t0 = time.time()
-        idx = self.tokenize(prompt)
-        kvc = self.prefill(idx)
-        parts = []
-        for _ in range(max_tokens):
-            logits = self.batcher.next({'ids': idx[:, -1:], 'kvcache': kvc})
-            t = _sample(logits[:, -1, :], temperature, top_k, top_p)
-            c = self.itos[int(t[0, 0])]
-            parts.append(c)
-            idx = np.concatenate([idx, t], axis=1)
-            if on_token:
-                on_token(c)
-        return ''.join(parts), time.time() - t0
-
-
-class Tracker:
-    """延迟统计：avg / p50 / p99"""
-
-    def __init__(self, cap=200):
-        self.lat = []
-        self.lock = threading.Lock()
-        self.cap = cap
-
-    def record(self, dt):
-        with self.lock:
-            self.lat.append(dt)
-            if len(self.lat) > self.cap:
-                self.lat.pop(0)
-
-    def summary(self):
-        with self.lock:
-            a = np.array(self.lat) * 1000
-            if len(a) == 0:
-                return {}
-            return {'count': int(len(a)), 'avg_ms': round(float(a.mean()), 1),
-                    'p50_ms': round(float(np.percentile(a, 50)), 1),
-                    'p99_ms': round(float(np.percentile(a, 99)), 1)}
+```json
+{
+  "prompt": "床前明月光",
+  "style": "五绝",
+  "enforce_meter": false,
+  "max_tokens": 32,
+  "temperature": 0.8,
+  "top_k": 20,
+  "top_p": null,
+  "stream": false
+}
 ```
 
-- [ ] **S5 实现 HTTP 处理器 `Handler` 与 `create_server`**
+| 字段 | 类型 | 默认 | 语义 |
+| --- | --- | --- | --- |
+| `prompt` | str | `""` | 提示词；空串或编码后为空 → 400 |
+| `style` | str \| null | `null` | 五个体裁之一：`五绝` / `七绝` / `五律` / `七律` / `杂言`；非空时在该 prompt **之前**拼对应诗体 token（`<五绝>` 等）；不属五者 → 400 |
+| `enforce_meter` | bool | `false` | 为真时挂 `meter.make_meter_processor`（**每请求独立构造**，句长首次调用时按 prompt 推断并冻结） |
+| `max_tokens` | int | `32` | 续写 token 上限；非正整数 → 400 |
+| `temperature` | float | `0.8` | 采样温度；必须 > 0，否则 400 |
+| `top_k` | int \| null | `20` | 采样 top-k；`null` 或 ≤ 0 视为不启用 |
+| `top_p` | float \| null | `null` | 核采样阈值；`null` 视为不启用 |
+| `stream` | bool | `false` | 为真时走 SSE |
 
-```python
-class Handler(BaseHTTPRequestHandler):
-    engine = None
-    tracker = None
+**非流式响应**（`200`，`application/json`）：
 
-    def do_GET(self):
-        if self.path == '/stats':
-            body = json.dumps(self.tracker.summary(), ensure_ascii=False).encode()
-            self._reply(200, 'application/json', body)
-        else:
-            self._reply(404, 'application/json', b'{"error":"not found"}')
-
-    def do_POST(self):
-        if self.path != '/v1/completions':
-            self._reply(404, 'application/json', b'{"error":"not found"}')
-            return
-        try:
-            length = int(self.headers.get('Content-Length', 0))
-            req = json.loads(self.rfile.read(length).decode('utf-8'))
-        except Exception:
-            self._reply(400, 'application/json', b'{"error":"bad json"}')
-            return
-        prompt = str(req.get('prompt', ''))
-        max_tokens = max(1, min(int(req.get('max_tokens', 32)), 256))
-        temperature = float(req.get('temperature', 0.8))
-        top_k = int(req.get('top_k')) if req.get('top_k') else None
-        top_p = float(req.get('top_p')) if req.get('top_p') else None
-        stream = bool(req.get('stream', False))
-        if stream:
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/event-stream')
-            self.end_headers()
-            t0 = time.time()
-
-            def on_token(c):
-                self.wfile.write(f"data: {json.dumps({'token': c}, ensure_ascii=False)}\n\n".encode())
-                self.wfile.flush()
-
-            text, dt = self.engine.complete(prompt, max_tokens, temperature, top_k, top_p, on_token)
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
-        else:
-            text, dt = self.engine.complete(prompt, max_tokens, temperature, top_k, top_p)
-            self._reply(200, 'application/json',
-                        json.dumps({'text': text}, ensure_ascii=False).encode())
-        self.tracker.record(dt)
-        print(f"[{time.strftime('%H:%M:%S')}] {prompt!r} -> {dt * 1000:.0f}ms, {len(text)}tok")
-
-    def _reply(self, code, ctype, body):
-        self.send_response(code)
-        self.send_header('Content-Type', ctype)
-        self.send_header('Content-Length', str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, *a):
-        pass
-
-
-def create_server(gpt, stoi, itos, port=8000, max_batch=4, max_wait=0.02):
-    Handler.engine = InferenceEngine(gpt, stoi, itos, max_batch, max_wait)
-    Handler.tracker = Tracker()
-    srv = ThreadingHTTPServer(('127.0.0.1', port), Handler)
-    return srv, srv.server_address[1]
-
-
-if __name__ == '__main__':
-    text, chars, stoi, itos, data = load_corpus()
-    gpt = GPT(vocab_size=len(chars))
-    gpt.load(os.path.join(BASE, 'model.npz'))
-    srv, port = create_server(gpt, stoi, itos)
-    print(f"LLM server on http://127.0.0.1:{port}/v1/completions")
-    try:
-        srv.serve_forever()
-    except KeyboardInterrupt:
-        srv.shutdown()
+```json
+{"text": "疑是地上霜。", "prompt": "床前明月光", "style": "五绝",
+ "head": "<五绝>床前明月光", "tokens": 6, "queued_ms": 1.2, "elapsed_ms": 41.7}
 ```
 
-- [ ] **S6 写集成测试：起服务 → 流式/非流式/并发 → /stats p99**
+| 字段 | 语义 |
+| --- | --- |
+| `text` | **只含续写部分**（不含 prompt、不含诗体 token），口径同 `tools/prosody_eval.py` 的 `generate_texts`（`as_numpy(out[0])[len(ids):]`） |
+| `prompt` / `style` | 回显请求参数（`style` 为 `null` 时原样回 `null`） |
+| `head` | 模型实际所见输入（含诗体 token，如 `<五绝>床前明月光`），便于自查 |
+| `tokens` | **实际**生成的 token 数（可小于 `max_tokens`） |
+| `queued_ms` | 入队到开始推理的等待时长（并发排队时体现） |
+| `elapsed_ms` | 纯推理时长（不含排队） |
+| `oov_dropped` | **仅当 > 0 时出现**：被跳过的词表外字符数 |
 
-```python
-"""server 集成测试：起服务 → 流式/非流式/并发 4 请求 → /stats 输出 p99"""
-import sys, os, json, threading, time
-import http.client
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from model.gpt import GPT
-from train import load_corpus
-from server import create_server
+**流式响应**（`200`，`text/event-stream`）：逐 token 一条事件，末尾 `[DONE]`
 
-def start(port=0):
-    text, chars, stoi, itos, data = load_corpus()
-    gpt = GPT(vocab_size=len(chars))
-    gpt.load('model.npz')
-    srv, p = create_server(gpt, stoi, itos, port=port)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    return srv, p
+```
+data: {"token": "疑"}
 
-def req(p, prompt, stream=False, max_tokens=16):
-    conn = http.client.HTTPConnection('127.0.0.1', p, timeout=30)
-    body = json.dumps({'prompt': prompt, 'max_tokens': max_tokens, 'stream': stream})
-    conn.request('POST', '/v1/completions', body, {'Content-Type': 'application/json'})
-    r = conn.getresponse()
-    data = r.read().decode('utf-8')
-    conn.close()
-    return r.status, data
+data: {"token": "是"}
 
-def stats(p):
-    conn = http.client.HTTPConnection('127.0.0.1', p, timeout=5)
-    conn.request('GET', '/stats')
-    r = conn.getresponse()
-    d = json.loads(r.read().decode())
-    conn.close()
-    return d
+data: [DONE]
 
-def test_server():
-    srv, p = start()
-    time.sleep(0.3)
-    st, data = req(p, '床前明月光')
-    assert st == 200 and len(json.loads(data)['text']) > 0, data
-    st, data = req(p, '春眠不觉晓', stream=True)
-    assert st == 200 and 'data:' in data and '[DONE]' in data, data
-    results = []
-    def worker(prompt):
-        results.append(req(p, prompt))
-    ts = [threading.Thread(target=worker, args=(pr,)) for pr in ['静夜思', '春晓', '江雪', '相思']]
-    [t.start() for t in ts]; [t.join() for t in ts]
-    assert all(s == 200 for s, _ in results), results
-    time.sleep(0.2)
-    s = stats(p)
-    print("stats:", s)
-    assert s['count'] >= 6
-    srv.shutdown()
-    print("server integration PASS")
-
-if __name__ == '__main__':
-    test_server()
 ```
 
-Run: `python test/test_server.py *> test/output-server.txt`
-Expected: `stats: {'count': 6, 'avg_ms': ..., 'p50_ms': ..., 'p99_ms': ...}` + `server integration PASS`
+**`GET /stats`** → `{"count": N, "avg_ms": .., "p50_ms": .., "p99_ms": ..}`（无数据时返回 `{}`）
 
-- [ ] **S7 收尾：commit + push**
+**`GET /health`** → `{"status": "ok", "model": "<档路径>", "ctx_len": 128}`
 
-Run: `git add server.py test/test_server.py; git commit -m "T6: HTTP 推理服务（连续批处理 + KV Cache + SSE + p99）"; git push`
+#### 6.3 边界与错误处理（严守「响亮失败」，严禁静默降级）
+
+| 情形 | 处理 |
+| --- | --- |
+| 路径不匹配 | `404` + `{"error": "not found"}` |
+| 请求体非合法 JSON / 非法 UTF-8 | `400` + `{"error": "bad json"}` |
+| `style` 不在五个体裁内 | `400` + `{"error": "invalid style", "allowed": ["五绝","七绝","五律","七律","杂言"]}` |
+| `prompt` 为空串，或分词后 id 序列为空（全为词表外字符） | `400` + `{"error": "empty prompt after tokenize"}`。**严禁**照旧版以 `stoi['\n']` 兜底——那会把客户端的输入错误伪装成一次正常生成 |
+| `len(prompt_ids) + max_tokens > ctx_len` | `400` + 错误信息回告「prompt 已占 N 个 token，当前最多可续写 M 个」。**严禁静默截断**——静默截断会让客户端以为拿到了足量文本 |
+| `len(prompt_ids) >= ctx_len` | `400`（同上，M 为 0，明示 prompt 过长） |
+| `max_tokens` ≤ 0 / `temperature` ≤ 0 | `400` + 指明字段 |
+| 模型推理抛异常 | `500` + `{"error": "inference failed", "type": "<异常类名>", "detail": "<消息>"}` |
+| HTTP 线程等待超时（默认 60s，`--timeout` 可调） | `504` + `{"error": "inference timeout"}` |
+
+**词表外字符（OOV）**：`train.encode` 会逐字符跳过。非流式响应在 `oov_dropped` 字段如实回告被跳过的字符数（0 时不出现该字段）；只要最终 id 序列非空即照常生成，**不因部分 OOV 而报错**。
+
+**超时取消协议（防推理线程被已断开的连接拖垮）**：请求超时（`504`）后，HTTP 线程会写完错误响应并关闭连接，但推理线程仍在为该请求生成、其 `on_token` 还在往**已关闭的 socket** 写数据——这会抛 `BrokenPipeError` / `ConnectionAbortedError`，若未捕获将**杀死唯一的推理线程，令整个服务瘫痪**。故：
+
+1. `Request` 带 `cancelled` 标志；HTTP 线程判定超时后**先**置 `req.cancelled = True`，**再**写 `504` 响应；
+2. `on_token` 及结果写回前**必须**检查 `cancelled`，已取消则立即返回、不再触碰 socket；
+3. 所有 socket 写入包 `try/except (BrokenPipeError, ConnectionAbortedError, OSError)`，捕获后置 `cancelled` 并停止写。**这是本服务唯一允许静默的场景**（客户端已断开，报错无人可收），但必须保证推理线程存活；
+4. 推理线程主循环对单请求异常一律 `try/except` 兜住并写入 `req.error`——**任何单请求异常都不得终止推理线程**。
+
+#### 6.4 已知限制（如实披露，不掩饰）
+
+1. **慢消费者会阻塞推理线程**：SSE 逐 token 写 socket，若客户端读取缓慢导致 TCP 缓冲写满，推理线程将阻塞在 `wfile.write` 上，后续所有请求排队等待。教学级可接受，生产级需改为发送队列 + 独立写线程。
+2. **单请求独占推理线程**：串行调度下，长请求会拖高后续请求的排队延迟（`/stats` 的 `elapsed_ms` 只计推理时长，不含排队，故另在响应中给 `queued_ms`）。
+3. **无 KV Cache 复用（前缀缓存）**：每个请求从零 prefill，同前缀请求不共享。
+
+#### 6.5 组件与职责
+
+| 组件 | 职责 | 关键接口 |
+| --- | --- | --- |
+| `Request` | 一次请求的载体（参数 + 结果槽 + `Event` + 回调） | 字段：`params` / `result` / `error` / `done` / `on_token` |
+| `InferenceEngine` | 独占模型；串行消费队列；调 `model.generate` | `submit(req)` / `start()` / `stop()` |
+| `Tracker` | 延迟统计：环形缓冲只留最近 `cap` 条 | `record(dt)` / `summary()` |
+| `Handler` | HTTP 路由、参数校验、SSE 写回；持取消标志、安全写 socket | `do_POST` / `do_GET` |
+| `create_server(...)` | 装配 Engine + Tracker + `ThreadingHTTPServer` | 返回 `(srv, engine, port)` |
+| `main()` | `argparse`（`--model` / `--port` / `--host` / `--timeout` / `--cap`），载档，起服务 | — |
+
+**`engine` / `tracker` 的挂载方式（禁用类属性）**：`Handler.engine = ...` 这类**类属性赋值在多实例下会互相覆盖**——测试中先后起两个服务即串台。改用**实例挂载**：`srv.engine = engine`、`srv.tracker = tracker`，`Handler` 内一律经 `self.server.engine` / `self.server.tracker` 访问。
+
+**模型载入**：`load_serving_model(path)` —— 按当前语料词表（`train.load_corpus()` 的 `stoi`）构造 `GPT(vocab_size=len(stoi), n_rhyme=..., use_tone=..., **ARCH)`，辅助头配置由档内参数自动识别（`rhyme_head.W` 列数定 `n_rhyme`、有无 `tone_head.W` 定 `use_tone`），载入后断言无缺失参数（口径同 `tools/prosody_eval.py` 的 `load_new_model`）。`ARCH = dict(d_model=256, n_head=8, n_layer=6, ctx_len=128)` 在 `server.py` 内定义，并由测试按档内 `tok_emb.shape` / `pos_emb.shape` / Block 计数交叉校验，防止骨干常量漂移。
+
+**默认权重档**：`model-gelv-m3.npz`（最新里程碑档）。
+
+#### 6.6 实施步骤（TDD，先红后绿）
+
+- [ ] **Step 1** `model/gpt.py`：`generate` 增 `on_token=None` 可选回调
+  - 位置：生成循环内 `idx = np.concatenate([idx, next_token], axis=1)` **之后**调用 `on_token(int(next_token[0, 0]))`
+  - 回归守卫：默认 `None` 时输出与改动前逐位一致（由 `test/test_gpt.py` 既有用例守卫）
+
+- [ ] **Step 2** `server.py`：`Tracker`（纯函数级，先写单测）
+  - 用例：空缓冲 `summary()` 返回 `{}`；记录 1/2/100 条后 count 正确；超过 `cap` 时只保留最近 `cap` 条
+
+- [ ] **Step 3** `server.py`：`InferenceEngine`（队列 + 单推理线程）
+  - 用例：两请求先后提交 → 结果正确且互不污染；单请求抛异常 → `req.error` 有值、**推理线程存活**且后续请求照常；`cancelled=True` 的请求 → `on_token` 不再被调用；`stop()` 后线程可退出
+
+- [ ] **Step 4** `server.py`：`Handler` 校验层
+  - **必须**把校验抽成模块级纯函数 `validate_params(body, stoi, ctx_len)` → `(params, err)`，在无 HTTP 的情况下穷举全部 7 类客户端错误（TDD 先红后绿）
+
+- [ ] **Step 5** `server.py`：`create_server` + `main`
+  - `ThreadingHTTPServer`（`daemon_threads`）；engine/tracker 按 §6.5 **实例挂载到 `srv`**（严禁类属性）；`main` 起服务后打印监听地址
+
+- [ ] **Step 6** `test/test_server.py` 集成测试（起真实服务，端口传 0 由系统分配）
+  - 非流式：`200` + `text` 非空 + `tokens` 为正整数且 ≤ `max_tokens` + `elapsed_ms > 0`
+  - 流式：响应含多条 `data: {"token": ...}` 且以 `data: [DONE]` 收尾
+  - `style`：回告 `head` 以 `<五绝>` 起头
+  - `enforce_meter`：生成文本的末半句汉字数符合 `meter.infer_line_len` 的推断值（尾锚判据）
+  - 并发：4 线程同时请求，全部 `200`，且 `/stats` 的 `count == 前序请求数 + 4`
+  - 客户端错误：**7 类**逐一断言状态码与 `error` 字段——404 路径不匹配 / bad json / invalid style / empty prompt / 超 ctx_len / 非法 `max_tokens` / 非法 `temperature`
+  - 服务端错误：`500` 用桩模型（`generate` 抛异常）构造，断言含 `type` 字段；`504` 用桩模型（`generate` 内 `sleep`）+ 极小 `--timeout` 构造
+
+- [ ] **Step 7** 真实起服务 + `curl` 实跑，输出落 `test/output-server.txt`
+  - 预期：非流式与流式各一段真实生成文本 + `/stats` 输出
+
+- [ ] **Step 8** 全仓回归：18 套单测 `fail=0`；`git diff` 确认 `model/gpt.py` 仅新增 `on_token` 相关行
+
+- [ ] **Step 9** 文档同步：`README.md` 中把「Task 6/7 未实现」改为「仅 Task 7（CLI）未实现」，目录结构补 `server.py`，使用方式补起服务与调用的实际命令（引用 `test/output-server.txt`）。
+
+- [ ] **Step 10** 收尾：`git diff --stat` 复核改动面；环境洁癖核查（无临时脚本残留）。（commit / push 候主子发话，不自动执行）
+
+- [ ] **Step 11** 验收判据（四条，缺一不可）
+  1. `python test/test_server.py` 全绿：非流式 / 流式 / `style` / `enforce_meter` / 并发 4 请求 / **7 类客户端错误 + 2 类服务端错误（500、504）** 逐一通过
+  2. 真实起服务 + 实际调用，输出落 `test/output-server.txt`（须含真实生成文本与 `/stats` 数字）
+  3. `model/gpt.py` 改动为纯增量（仅 `on_token` 相关行），全仓 18 套单测 `fail=0`
+  4. 文档同步：`README.md` 与本节规格、实际代码三者逐条一致
+
+**实施注意**：Step 1–6 逐步「先写用例 → 跑红 → 实现 → 跑绿」；Step 7 必须**真实起服务实跑**（严禁假跑）；Step 8–11 全部取证留痕。收官后呈主子终验，commit / push 候主子发话。
 
 ---
 
 ### Task 7: cli.py —— 命令行交互 + 全量验证收尾
+
+> **状态（2026-09-16）：未实现，不在本轮范围。** 主子 2026-09-16 定档：本轮只做 Task 6（HTTP 推理服务）。本节保留为后续计划；实施前**必须先复核其全部前提**——上文 Task 6 旧版正因写于 T0 之前、假设全部失效而整体重写，Task 7 旧版同源，其 `load_corpus` 五元组 / `GPT(vocab_size=len(chars))` 等前提同样已失效。
 
 **教学主线:** 最后一块拼图——CLI 让本地加载权重直接生成，不需要起服务。然后全量回归、更新 README、交付检查，收尾。
 
