@@ -1010,7 +1010,7 @@ Run: `git add train.py test/test_train.py; git commit -m "T5: 训练循环（手
 
 ### Task 6: server.py —— HTTP 推理服务（KV Cache 增量解码 + SSE 流式 + p99）
 
-> **状态（2026-11-05）：已完成并验收。** Step 1–11 全数走完：`server.py`（单推理线程串行调度 + 非流式/SSE + `/health` `/stats` `/v1/completions`）、`test/test_server.py` 35 条用例、`GPT.generate` 纯增量 `on_token` 回调、真档集成（7 类客户端错误 / 并发 4 / 500 / 504 / `style` 前缀 / `enforce_meter` 尾锚）、`curl` 实跑留痕 `test/output-server.txt`、全仓 19 套单测 `fail=0`、`README.md` 已同步。Task 7（CLI）仍未实现。
+> **状态（2026-11-05）：已完成并验收。** Step 1–11 全数走完：`server.py`（单推理线程串行调度 + 非流式/SSE + `/health` `/stats` `/v1/completions`）、`test/test_server.py` 35 条用例、`GPT.generate` 纯增量 `on_token` 回调、真档集成（7 类客户端错误 / 并发 4 / 500 / 504 / `style` 前缀 / `enforce_meter` 尾锚）、`curl` 实跑留痕 `test/output-server.txt`、全仓 19 套单测 `fail=0`、`README.md` 已同步。Task 7（CLI）已于同日完成（见下节）。
 
 > **本节于 2026-09-16 就地重写，旧版全部废止。** 旧版写于 T0 之前，其前提与现状不符：假设词表 2577 项、`load_corpus()` 返回 5 元组、`GPT(vocab_size=len(chars))` 直接装配；现状为词表 **8201** 项（纯文本 8196 + 5 个诗体 token）、`load_corpus()` 返回 **6 元组**、里程碑档须按 `n_rhyme` / `use_tone` 装配。更关键的是旧版 `Batcher` 在独立线程内直调 `model.forward`，而 `forward` 会写实例属性 `self.logits` / `self.x_cache`——与 prefill 并发时构成**数据竞争**，属设计缺陷。
 >
@@ -1023,7 +1023,7 @@ Run: `git add train.py test/test_train.py; git commit -m "T5: 训练循环（手
 | 类别 | 内容 |
 | --- | --- |
 | **做** | `server.py`：单推理线程串行调度 + KV Cache 增量解码 + 非流式/SSE 流式 + `/stats` 延迟统计（count/avg/p50/p99）+ 两个可选开关（`style` 诗体、`enforce_meter` 句长约束） |
-| **不做** | `cli.py`（本轮范围外）、连续批处理攒批（Batcher）、BoN 格律选优、鉴权、请求持久化日志 |
+| **不做** | `cli.py`（属 Task 7，已完成）、连续批处理攒批（Batcher）、BoN 格律选优、鉴权、请求持久化日志 |
 
 **Files:**
 - Create: `server.py`
@@ -1206,76 +1206,147 @@ data: [DONE]
 
 ### Task 7: cli.py —— 命令行交互 + 全量验证收尾
 
-> **状态（2026-09-16）：未实现，不在本轮范围。** 主子 2026-09-16 定档：本轮只做 Task 6（HTTP 推理服务）。本节保留为后续计划；实施前**必须先复核其全部前提**——上文 Task 6 旧版正因写于 T0 之前、假设全部失效而整体重写，Task 7 旧版同源，其 `load_corpus` 五元组 / `GPT(vocab_size=len(chars))` 等前提同样已失效。
+> **状态（2026-11-05）：已完成并验收。** S1–S8 全数走完：`cli.py`（`encode_prompt` / `generate_text` / `main`）、`test/test_cli.py` 6 条用例（先红后绿）、真档实跑留痕 `test/output-cli.txt`（3 条成功 + 2 条错误按退出码 2 失败）、全仓 **20** 套单测 `fail=0`、`README.md` 已同步。
+
+> **本节于 2026-11-05 就地重写，旧版全部废止。** 旧版写于 T0 之前，前提逐条失效，实施前复核结果如下：
+
+| 旧版假设 | 现状 | 处置 |
+| --- | --- | --- |
+| `text, chars, stoi, itos, data = load_corpus()`（5 元组） | 实为 **6 元组**（末尾多 `special_ids`） | 不直接解包全量，改用 `train.encode` 与 `load_serving_model` |
+| `GPT(vocab_size=len(chars))` | 词表 **8201** = 纯文本 8196 + 5 个诗体 token；里程碑档还带 `n_rhyme` / `use_tone` | 复用 `server.load_serving_model`（按档自动装配辅助头 + 缺失参数断言） |
+| 默认权重 `model.npz` | 其嵌入表为 `(8196, 256)`，与现语料 8201 不对齐，按名载参必缺 5 行 | 默认改 `model-gelv-m3.npz` |
+| `[[stoi[c] for c in prompt if c in stoi]]` | 不认诗体特殊 token；全 OOV 时旧版以换行兜底 | 改用 `train.encode`（诗体 token 计 1 个 id）；分词为空**响亮报错** |
+| `print(''.join(... for i in out[0]))` | `generate` 返回含提示词的完整序列，会重复打印 | 只取 `out[0, T:]` 续写部分 |
+| 无 ctx 越界检查 | `pos_emb` 仅 `ctx_len` 行，超长以内核形状错崩溃 | 入口拒绝：`prompt_tokens + max_tokens > ctx_len` |
+| S4 只跑 3 个测试文件 | 全仓已 19 套（加本套 **20** 套） | 全量回归 |
 
 **教学主线:** 最后一块拼图——CLI 让本地加载权重直接生成，不需要起服务。然后全量回归、更新 README、交付检查，收尾。
 
 **Files:**
 - Create: `cli.py`
+- Create: `test/test_cli.py`
+- Modify: `README.md`（目录树、测试清单、新增「命令行生成器」使用小节）
+- Modify: `PLAN.md`（本节重写）
 
-- [ ] **S1 讲解 CLI 定位**
-  - 与 server 的区别：CLI 本地单机直接推理（不经过 HTTP、不组批），适合快速试模型
-  - 复用 `load_corpus`（分词）和 `GPT.generate`（KV Cache 生成），代码很薄
-  - `argparse`：命令行参数 prompt / --max-tokens / --temperature / --top-k / --top-p
+- [x] **S1 讲解 CLI 定位（2026-11-05 复核后定稿）**
+  - 与 server 的分工：server 面向多客户端（串行排队 / SSE / 延迟统计）；CLI 单机一次生成，用于快速试模型
+  - 复用面：`server.load_serving_model`（装档口径）、`train.encode`（分词，认诗体 token）、`GPT.generate`（KV Cache 增量解码）
+  - `argparse`：`prompt` 位置参数 + `--model` / `--max-tokens` / `--temperature` / `--top-k` / `--top-p`
+  - 与 server 同口径的两条硬规矩：分词后为空**不兜底换行**；`prompt_tokens + max_tokens > ctx_len` **直接拒绝**
 
-- [ ] **S2 实现 `cli.py`**
+- [x] **S2 先写用例 `test/test_cli.py`（6 条，先红后绿）**
+  - 红：`python test/test_cli.py` → `ModuleNotFoundError: No module named 'cli'`（功能缺失，非用例笔误）
+  - 覆盖：基本编码 / 诗体 token 计 1 个 id / 全 OOV 报错 / 只取续写 / 采样参数透传 / ctx 越界报错
+
+- [x] **S3 实现 `cli.py`**
 
 ```python
-"""CLI：加载 model.npz 本地交互生成"""
+"""CLI：加载权重档，本地直接生成（不经 HTTP、不起服务）
+
+与 `server.py` 的分工：server 面向多客户端（串行排队 + SSE + 延迟统计）；
+CLI 面向单机快速试模型——一条命令、一次生成、直接看文本。
+
+启动：`python cli.py "床前明月光" --max-tokens 40`
+诗体起句可直接把标签写进提示词：`python cli.py "<五绝>床前明月光"`
+"""
 import argparse
 import os
 import sys
-import numpy as np
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, BASE)
-from model.gpt import GPT
-from train import load_corpus
+if BASE not in sys.path:
+    sys.path.insert(0, BASE)
+
+import train
+from model.backend import np as onp, as_numpy
+from server import load_serving_model
 
 
-def main():
-    ap = argparse.ArgumentParser(description='极简 LLM 命令行生成')
-    ap.add_argument('prompt', nargs='?', default='床前明月光')
-    ap.add_argument('--max-tokens', type=int, default=60)
-    ap.add_argument('--temperature', type=float, default=0.8)
-    ap.add_argument('--top-k', type=int, default=20)
-    ap.add_argument('--top-p', type=float, default=None)
-    args = ap.parse_args()
-    text, chars, stoi, itos, data = load_corpus()
-    gpt = GPT(vocab_size=len(chars))
-    gpt.load(os.path.join(BASE, 'model.npz'))
-    idx = np.array([[stoi[c] for c in args.prompt if c in stoi]], dtype=np.int64)
-    if idx.shape[1] == 0:
-        idx = np.array([[stoi['\n']]], dtype=np.int64)
-    out = gpt.generate(idx, args.max_tokens, args.temperature, args.top_k, args.top_p)
-    print(''.join(itos[int(i)] for i in out[0]))
+def encode_prompt(prompt, stoi):
+    """把提示词编码成 [1,T] 的 id 数组。
+
+    复用 `train.encode`：先匹配诗体特殊 token（1 个 id），未匹配处逐字符查表。
+    分词后为空（全为词表外字符）必须响亮报错——严禁以换行符兜底，
+    否则客户端输错提示词也会被静默掩盖（口径与 server 的参数校验一致）。
+    """
+    ids = train.encode(prompt, stoi)
+    if len(ids) == 0:
+        raise ValueError("提示词 %r 分词后为空（全部字符不在词表内）" % prompt)
+    return onp.asarray([ids], dtype=onp.int64)
 
 
-if __name__ == '__main__':
-    main()
+def generate_text(model, itos, ids, max_tokens, temperature, top_k, top_p):
+    """从 ids 续写 max_tokens 个 token，返回**续写部分**的文本（不含提示词）。
+
+    越界必须响亮报错：`pos_emb` 只有 ctx_len 行，超长会让位置嵌入越界崩溃；
+    与其让内核抛晦涩的形状错误，不如在入口按「提示词 + 续写 ≤ ctx_len」直接拒绝。
+    """
+    used = int(ids.shape[1])
+    ctx_len = int(model.ctx_len)
+    if used + int(max_tokens) > ctx_len:
+        raise ValueError("上下文不足：提示词 %d + max_tokens %d > ctx_len %d"
+                         % (used, int(max_tokens), ctx_len))
+    out = model.generate(ids, int(max_tokens), temperature=temperature,
+                         top_k=top_k, top_p=top_p)
+    new = as_numpy(out)[0, used:]                  # 只取续写部分，避免重复打印提示词
+    return "".join(itos.get(int(t), "") for t in new)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="极简 LLM 命令行生成")
+    ap.add_argument("prompt", nargs="?", default="床前明月光", help="起句（可含 <五绝> 等诗体标签）")
+    ap.add_argument("--model", default=os.path.join(BASE, "model-gelv-m3.npz"),
+                    help="权重档路径（默认 model-gelv-m3.npz）")
+    ap.add_argument("--max-tokens", type=int, default=40, help="续写 token 数（默认 40）")
+    ap.add_argument("--temperature", type=float, default=0.8, help="采样温度（默认 0.8）")
+    ap.add_argument("--top-k", type=int, default=20, help="Top-K 截断（默认 20；≤0 视为不启用）")
+    ap.add_argument("--top-p", type=float, default=None, help="核采样阈值（默认不启用）")
+    args = ap.parse_args(argv)
+
+    # CLI 参数即用户输入边界：非法值当场拒绝，不把晦涩报错留给内核
+    if args.max_tokens <= 0:
+        ap.error("--max-tokens 必须 > 0")
+    if args.temperature <= 0:
+        ap.error("--temperature 必须 > 0")
+    top_k = args.top_k if args.top_k > 0 else None
+
+    model, stoi, itos = load_serving_model(args.model)
+    try:
+        ids = encode_prompt(args.prompt, stoi)
+        text = generate_text(model, itos, ids, args.max_tokens,
+                             args.temperature, top_k, args.top_p)
+    except ValueError as exc:
+        print("错误：%s" % exc, file=sys.stderr)
+        return 2
+    print(args.prompt + text)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
 ```
 
-- [ ] **S3 CLI 生成演示并落 output 文件**
+- [x] **S4 真档实跑落 `test/output-cli.txt`**
 
-Run: `python cli.py "床前明月光" --max-tokens 40 *> test/output-cli.txt`
-Expected: 输出一段古诗风格中文，写入 output-cli.txt
+Run: 5 个场景——`python cli.py "床前明月光" --max-tokens 40`、`python cli.py "<五绝>床前明月光" --max-tokens 40`、`python cli.py "海上生明月" --max-tokens 40 --temperature 0.6 --top-p 0.9`、`python cli.py "abc"`、`python cli.py "床前明月光" --max-tokens 200`
+Expected: 前三条输出古诗风格续写（实得「床前明月光起，…」等）；后两条分别报「分词后为空」「上下文不足」且退出码均为 2
 
-- [ ] **S4 全量测试回归（从根目录）**
+- [x] **S5 全量测试回归（20 套）**
 
-Run: `python test/test_layers.py; python test/test_attention.py; python test/test_gpt.py`
-Expected: 三个文件均输出 `ALL ... TESTS PASS`
+Run: `Get-ChildItem test -Filter "test_*.py" | ForEach-Object { python "test/$($_.Name)" }`
+Expected: 全数退出码 0，`test/output-regression.txt` 末行 `suite_total=20  fail=0`
 
-- [ ] **S5 更新 README 使用部分**
-  - 把「使用方式（实现后生效）」改为实际命令 + 引用三个 output 文件
+- [x] **S6 更新 README 使用部分**
+  - 目录树补 `cli.py`；测试清单补 `python test/test_cli.py`；新增 §九.8「命令行生成器（Task 7）」
 
-- [ ] **S6 最终交付检查**
-  - 确认仓库根目录下存在：README.md、PLAN.md、data/corpus.txt、model/{__init__,layers,attention,gpt}.py、train.py、server.py、cli.py、model.npz、test/output-train.txt、test/output-cli.txt、test/output-server.txt
+- [x] **S7 最终交付检查**
+  - 确认根目录存在：README.md、PLAN.md、train.py、server.py、cli.py、meter.py、prosody.py、model/*.py、`test/output-{train,server,cli,regression}.txt`
   - 确认无临时脚本残留（环境洁癖）
-  - 清理：`test/__init__.py` 与 `model/__init__.py` 保留（包标记必需）
+  - `test/__init__.py` 与 `model/__init__.py` 保留（包标记必需）
 
-- [ ] **S7 收尾：commit + push**
+- [x] **S8 收官：commit（push 候主子发话）**
 
-Run: `git add cli.py; git commit -m "T7: CLI + README 收尾"; git push`
+Run: `git add cli.py test/test_cli.py test/output-cli.txt test/output-regression.txt PLAN.md README.md; git commit -m "T7: CLI 命令行生成 + 全量回归 + 文档同步"`
 
 ---
 
@@ -1290,7 +1361,7 @@ Run: `git add cli.py; git commit -m "T7: CLI + README 收尾"; git push`
 | T5a | `python test/test_train.py` | — | 60 步 loss 下降 |
 | T5b | `python train.py *> test/output-train.txt` | model.npz + output | loss <4.5，生成有规律 |
 | T6 | `python test/test_server.py *> test/output-server.txt` | output-server.txt | 流式/非流式/并发/p99 |
-| T7 | `python cli.py "床前明月光" *> test/output-cli.txt` | output-cli.txt | 古诗风格文本 |
+| T7 | `python cli.py "床前明月光" --max-tokens 40 *> test/output-cli.txt` | output-cli.txt | 古诗风格续写；全 OOV / ctx 越界退出码 2 |
 
 ## 训练资料知识点 → 计划映射
 

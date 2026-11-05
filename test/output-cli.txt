@@ -1,0 +1,36 @@
+=== 环境 ===
+Python 3.13；未设 MINIMAL_GPU=1（纯 numpy CPU 后端）。PYTHONWARNINGS=ignore 仅用于隐去 cupy 导入警告，与本 CLI 无关。
+
+=== 1) python cli.py "床前明月光" --max-tokens 40 ===
+按名载参 D:\Wing_D\desktop\tmp\Minimal-LLM\model-gelv-m3.npz：缺失 0 个新增参数，按初始化保留
+床前明月光起，
+<七绝>花边绿新红色未生，风暖烟轻雨。
+不羡新诗人不知，空留不住不忧名。
+<七绝>风烟
+
+=== 2) python cli.py "<五绝>床前明月光" --max-tokens 40（诗体标签直接写进提示词） ===
+按名载参 D:\Wing_D\desktop\tmp\Minimal-LLM\model-gelv-m3.npz：缺失 0 个新增参数，按初始化保留
+<五绝>床前明月光。
+<五律>行路难，路难人去，人不行。
+不得自我不爱人，
+我自说无心总是人。
+不闻南国
+
+=== 3) python cli.py "海上生明月" --max-tokens 40 --temperature 0.6 --top-p 0.9 ===
+按名载参 D:\Wing_D\desktop\tmp\Minimal-LLM\model-gelv-m3.npz：缺失 0 个新增参数，按初始化保留
+海上生明月，江山无死是生时。
+<七绝>金谷风露沾，玉壶冰水清。
+自能高兴薄，还逐远风轻。
+一雨天
+
+=== 4) 错误：提示词全为词表外字符（响亮失败，不兜底换行） ===
+$ python cli.py "abc"
+按名载参 D:\Wing_D\desktop\tmp\Minimal-LLM\model-gelv-m3.npz：缺失 0 个新增参数，按初始化保留
+错误：提示词 'abc' 分词后为空（全部字符不在词表内）
+[exit] 2
+
+=== 5) 错误：上下文越界（提示词 5 + 200 > ctx_len 128） ===
+$ python cli.py "床前明月光" --max-tokens 200
+按名载参 D:\Wing_D\desktop\tmp\Minimal-LLM\model-gelv-m3.npz：缺失 0 个新增参数，按初始化保留
+错误：上下文不足：提示词 5 + max_tokens 200 > ctx_len 128
+[exit] 2

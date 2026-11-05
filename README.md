@@ -16,8 +16,8 @@
    - BoN 自蒸馏混合再训
    - 格律评估与 A/B 对照、句长约束采样
 
-形态为「训练 + 工具链 + HTTP 推理服务」：`server.py` 提供单推理线程串行调度的推理接口
-（非流式 + SSE 流式，Task 6）；命令行生成器（Task 7）仍未实现。
+形态为「训练 + 工具链 + HTTP 推理服务 + 命令行」：`server.py` 提供单推理线程串行调度的推理接口
+（非流式 + SSE 流式，Task 6）；`cli.py` 本地直接加载权重生成（Task 7）。
 
 ## 二、系统架构
 
@@ -51,6 +51,8 @@
 
 采样期可用 `meter.py` 的句长约束处理器（作为 `logits_processor` 挂在 `GPT.generate` 上）强制半句字数与断句。
 
+`cli.py` 复用同一套权重装载与解码口径，在本地直接生成（不经 HTTP、不排队），用于快速试模型。
+
 ## 三、模型规模
 
 分词为 char-level。词表 = 语料纯文本字符表（8196 项）+ 5 个诗体控制 token（`<五绝>`、`<七绝>`、`<五律>`、`<七律>`、`<杂言>`，追加在末尾，id 8196..8200），合计 8201。
@@ -73,11 +75,12 @@
 ```
 Minimal-LLM/
 ├── README.md            # 本文档（设计 + 使用说明）
-├── PLAN.md              # 早期分阶段实现计划（Task 6 HTTP 推理服务已实现；Task 7 CLI 未实现，不在本仓库范围内）
+├── PLAN.md              # 早期分阶段实现计划（Task 6 HTTP 推理服务、Task 7 CLI 均已实现）
 ├── prosody.py           # 格律工具：平水韵查表（字→平仄/韵部）+ 句长/押韵/平仄/对仗判定 + 综合打分
 ├── meter.py             # 采样期句长约束处理器（挂到 GPT.generate 的 logits_processor）
 ├── train.py             # 数据加载 / 编码 / 加权损失抽题 / AdamW / 学习率调度 / 续训 checkpoint / 训练循环
 ├── server.py            # HTTP 推理服务：单推理线程串行调度 + SSE 流式 + 延迟统计（/health、/stats、/v1/completions）
+├── cli.py               # 命令行生成器：本地加载权重直接生成（复用 server 的装档口径）
 ├── model/
 │   ├── __init__.py
 │   ├── backend.py       # 计算后端总闸：默认 numpy(CPU)；MINIMAL_GPU=1 且探活通过时切 cupy(GPU)
@@ -277,6 +280,7 @@ python test/test_selftrain.py
 python test/test_prosody_eval.py
 python test/test_backend_gpu.py
 python test/test_server.py
+python test/test_cli.py
 ```
 
 汇总运行（PowerShell，逐个运行并汇报失败项）：
@@ -349,3 +353,21 @@ data: [DONE]
 
 自测：`python test/test_server.py`（35 条用例：真档形状交叉校验、7 类客户端错误、
 并发 4、500/504、流式与断连取消）；实跑留痕见 `test/output-server.txt`。
+
+### 8. 命令行生成器（Task 7）
+
+```bash
+python cli.py "床前明月光" --max-tokens 40
+python cli.py "<五绝>床前明月光" --max-tokens 40    # 诗体标签可直接写进提示词
+```
+
+参数：`--model` 权重档路径（默认 `model-gelv-m3.npz`）、`--max-tokens`（默认 40）、
+`--temperature`（默认 0.8，须 > 0）、`--top-k`（默认 20，`≤0` 视为不启用）、
+`--top-p`（默认不启用）。
+
+与 HTTP 服务共用同一套装载与解码口径：`load_serving_model` 按档内 `rhyme_head.W` 列数 /
+有无 `tone_head.W` 自动装配辅助头，并断言无缺失参数；提示词经 `train.encode` 编码
+（诗体 token 计 1 个 id）。分词后为空、或 `prompt_tokens + max_tokens > ctx_len`
+一律以退出码 2 响亮失败，不以换行符兜底。输出只打印「提示词 + 续写」，不重复提示词。
+
+自测：`python test/test_cli.py`（6 条用例）；实跑留痕见 `test/output-cli.txt`。
