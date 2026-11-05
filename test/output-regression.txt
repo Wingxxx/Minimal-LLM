@@ -1,0 +1,21 @@
+test_attention.py          exit=0     25.5s  ALL ATTENTION TESTS PASS
+test_aux_heads.py          exit=0     21.9s  ALL AUX HEADS TESTS PASS
+test_backend_gpu.py        exit=0     61.3s  gpu_smoke_train_20_steps PASS  loss=0.9956  每步 237.80 ms（最快 39.06 ms）  GPU=NVIDIA GeForce GTX 1650  显存 4.00 GiB
+test_batch_ext.py          exit=0     22.3s  C:\Users\27170\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\site-packages\cupy\_environment.py:286: UserWarning: CUDA path could not be detected. Set CUDA_PATH environment variable if CuPy fails to load.
+test_checkpoint.py         exit=0     21.5s  atomic_write PASS
+test_corpus.py             exit=0      6.3s  
+test_critic.py             exit=0      2.1s  
+test_gpt.py                exit=0     20.0s  ALL GPT TESTS PASS
+test_kv_cache.py           exit=0     21.2s    缓存长度逐步递增断言: PASS
+test_layers.py             exit=0     20.3s  C:\Users\27170\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\site-packages\cupy\_environment.py:286: UserWarning: CUDA path could not be detected. Set CUDA_PATH environment variable if CuPy fails to load.
+test_meter.py              exit=0     20.4s  end_to_end_line_len PASS
+test_pingshui.py           exit=0      4.4s  
+test_prosody.py            exit=0     19.8s  C:\Users\27170\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\site-packages\cupy\_environment.py:286: UserWarning: CUDA path could not be detected. Set CUDA_PATH environment variable if CuPy fails to load.
+test_prosody_eval.py       exit=0     78.9s  ✓ test_build_eval_pool_stale_file_fails_loudly
+test_selftrain.py          exit=0    183.1s  C:\Users\27170\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\site-packages\cupy\_environment.py:286: UserWarning: CUDA path could not be detected. Set CUDA_PATH environment variable if CuPy fails to load.
+test_server.py             exit=0     34.8s  ALL SERVER TESTS PASS
+test_tokenizer.py          exit=0     29.1s  C:\Users\27170\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\site-packages\cupy\_environment.py:286: UserWarning: CUDA path could not be detected. Set CUDA_PATH environment variable if CuPy fails to load.
+test_vocab_migrate.py      exit=0     34.9s  C:\Users\27170\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\site-packages\cupy\_environment.py:286: UserWarning: CUDA path could not be detected. Set CUDA_PATH environment variable if CuPy fails to load.
+test_weighted_loss.py      exit=0     21.0s  C:\Users\27170\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\site-packages\cupy\_environment.py:286: UserWarning: CUDA path could not be detected. Set CUDA_PATH environment variable if CuPy fails to load.
+
+suite_total=19  fail=0

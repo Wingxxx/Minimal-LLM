@@ -1010,6 +1010,8 @@ Run: `git add train.py test/test_train.py; git commit -m "T5: 训练循环（手
 
 ### Task 6: server.py —— HTTP 推理服务（KV Cache 增量解码 + SSE 流式 + p99）
 
+> **状态（2026-11-05）：已完成并验收。** Step 1–11 全数走完：`server.py`（单推理线程串行调度 + 非流式/SSE + `/health` `/stats` `/v1/completions`）、`test/test_server.py` 35 条用例、`GPT.generate` 纯增量 `on_token` 回调、真档集成（7 类客户端错误 / 并发 4 / 500 / 504 / `style` 前缀 / `enforce_meter` 尾锚）、`curl` 实跑留痕 `test/output-server.txt`、全仓 19 套单测 `fail=0`、`README.md` 已同步。Task 7（CLI）仍未实现。
+
 > **本节于 2026-09-16 就地重写，旧版全部废止。** 旧版写于 T0 之前，其前提与现状不符：假设词表 2577 项、`load_corpus()` 返回 5 元组、`GPT(vocab_size=len(chars))` 直接装配；现状为词表 **8201** 项（纯文本 8196 + 5 个诗体 token）、`load_corpus()` 返回 **6 元组**、里程碑档须按 `n_rhyme` / `use_tone` 装配。更关键的是旧版 `Batcher` 在独立线程内直调 `model.forward`，而 `forward` 会写实例属性 `self.logits` / `self.x_cache`——与 prefill 并发时构成**数据竞争**，属设计缺陷。
 >
 > 经主子 2026-09-16 准行**甲案（教学级：能跑通、好读、无竞态）**，本节重写如下。
@@ -1158,23 +1160,23 @@ data: [DONE]
 
 #### 6.6 实施步骤（TDD，先红后绿）
 
-- [ ] **Step 1** `model/gpt.py`：`generate` 增 `on_token=None` 可选回调
+- [x] **Step 1** `model/gpt.py`：`generate` 增 `on_token=None` 可选回调
   - 位置：生成循环内 `idx = np.concatenate([idx, next_token], axis=1)` **之后**调用 `on_token(int(next_token[0, 0]))`
   - 回归守卫：默认 `None` 时输出与改动前逐位一致（由 `test/test_gpt.py` 既有用例守卫）
 
-- [ ] **Step 2** `server.py`：`Tracker`（纯函数级，先写单测）
+- [x] **Step 2** `server.py`：`Tracker`（纯函数级，先写单测）
   - 用例：空缓冲 `summary()` 返回 `{}`；记录 1/2/100 条后 count 正确；超过 `cap` 时只保留最近 `cap` 条
 
-- [ ] **Step 3** `server.py`：`InferenceEngine`（队列 + 单推理线程）
+- [x] **Step 3** `server.py`：`InferenceEngine`（队列 + 单推理线程）
   - 用例：两请求先后提交 → 结果正确且互不污染；单请求抛异常 → `req.error` 有值、**推理线程存活**且后续请求照常；`cancelled=True` 的请求 → `on_token` 不再被调用；`stop()` 后线程可退出
 
-- [ ] **Step 4** `server.py`：`Handler` 校验层
+- [x] **Step 4** `server.py`：`Handler` 校验层
   - **必须**把校验抽成模块级纯函数 `validate_params(body, stoi, ctx_len)` → `(params, err)`，在无 HTTP 的情况下穷举全部 7 类客户端错误（TDD 先红后绿）
 
-- [ ] **Step 5** `server.py`：`create_server` + `main`
+- [x] **Step 5** `server.py`：`create_server` + `main`
   - `ThreadingHTTPServer`（`daemon_threads`）；engine/tracker 按 §6.5 **实例挂载到 `srv`**（严禁类属性）；`main` 起服务后打印监听地址
 
-- [ ] **Step 6** `test/test_server.py` 集成测试（起真实服务，端口传 0 由系统分配）
+- [x] **Step 6** `test/test_server.py` 集成测试（起真实服务，端口传 0 由系统分配）
   - 非流式：`200` + `text` 非空 + `tokens` 为正整数且 ≤ `max_tokens` + `elapsed_ms > 0`
   - 流式：响应含多条 `data: {"token": ...}` 且以 `data: [DONE]` 收尾
   - `style`：回告 `head` 以 `<五绝>` 起头
@@ -1183,19 +1185,19 @@ data: [DONE]
   - 客户端错误：**7 类**逐一断言状态码与 `error` 字段——404 路径不匹配 / bad json / invalid style / empty prompt / 超 ctx_len / 非法 `max_tokens` / 非法 `temperature`
   - 服务端错误：`500` 用桩模型（`generate` 抛异常）构造，断言含 `type` 字段；`504` 用桩模型（`generate` 内 `sleep`）+ 极小 `--timeout` 构造
 
-- [ ] **Step 7** 真实起服务 + `curl` 实跑，输出落 `test/output-server.txt`
+- [x] **Step 7** 真实起服务 + `curl` 实跑，输出落 `test/output-server.txt`
   - 预期：非流式与流式各一段真实生成文本 + `/stats` 输出
 
-- [ ] **Step 8** 全仓回归：18 套单测 `fail=0`；`git diff` 确认 `model/gpt.py` 仅新增 `on_token` 相关行
+- [x] **Step 8** 全仓回归：19 套单测 `fail=0`；`git diff` 确认 `model/gpt.py` 仅新增 `on_token` 相关行
 
-- [ ] **Step 9** 文档同步：`README.md` 中把「Task 6/7 未实现」改为「仅 Task 7（CLI）未实现」，目录结构补 `server.py`，使用方式补起服务与调用的实际命令（引用 `test/output-server.txt`）。
+- [x] **Step 9** 文档同步：`README.md` 中把「Task 6/7 未实现」改为「仅 Task 7（CLI）未实现」，目录结构补 `server.py`，使用方式补起服务与调用的实际命令（引用 `test/output-server.txt`）。
 
-- [ ] **Step 10** 收尾：`git diff --stat` 复核改动面；环境洁癖核查（无临时脚本残留）。（commit / push 候主子发话，不自动执行）
+- [x] **Step 10** 收尾：`git diff --stat` 复核改动面；环境洁癖核查（无临时脚本残留）。（commit / push 候主子发话，不自动执行）
 
-- [ ] **Step 11** 验收判据（四条，缺一不可）
+- [x] **Step 11** 验收判据（四条，缺一不可）
   1. `python test/test_server.py` 全绿：非流式 / 流式 / `style` / `enforce_meter` / 并发 4 请求 / **7 类客户端错误 + 2 类服务端错误（500、504）** 逐一通过
   2. 真实起服务 + 实际调用，输出落 `test/output-server.txt`（须含真实生成文本与 `/stats` 数字）
-  3. `model/gpt.py` 改动为纯增量（仅 `on_token` 相关行），全仓 18 套单测 `fail=0`
+  3. `model/gpt.py` 改动为纯增量（仅 `on_token` 相关行），全仓 19 套单测 `fail=0`
   4. 文档同步：`README.md` 与本节规格、实际代码三者逐条一致
 
 **实施注意**：Step 1–6 逐步「先写用例 → 跑红 → 实现 → 跑绿」；Step 7 必须**真实起服务实跑**（严禁假跑）；Step 8–11 全部取证留痕。收官后呈主子终验，commit / push 候主子发话。

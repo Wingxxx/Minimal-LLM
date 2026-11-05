@@ -1,0 +1,42 @@
+=== 启动日志（server.py stdout） ===
+按名载参 D:\Wing_D\desktop\tmp\Minimal-LLM\model-gelv-m3.npz：缺失 0 个新增参数，按初始化保留
+serving on http://127.0.0.1:8123  model=D:\Wing_D\desktop\tmp\Minimal-LLM\model-gelv-m3.npz
+
+=== GET /health ===
+{"status": "ok", "model": "D:\\Wing_D\\desktop\\tmp\\Minimal-LLM\\model-gelv-m3.npz", "ctx_len": 128}
+
+=== GET /stats（尚无请求） ===
+{}
+
+=== POST /v1/completions（非流式，max_tokens=8） ===
+{"text": "。\n<五律>一家有儿妾", "prompt": "床前明月光", "style": null, "head": "床前明月光", "tokens": 8, "queued_ms": 0.05, "elapsed_ms": 156.36}
+
+=== POST /v1/completions（style=五绝 + enforce_meter，max_tokens=7） ===
+{"text": "，玉树初凉露。", "prompt": "床前明月光", "style": "五绝", "head": "<五绝>床前明月光", "tokens": 7, "queued_ms": 0.11, "elapsed_ms": 100.44}
+
+=== POST /v1/completions（流式 SSE，max_tokens=8） ===
+data: {"token": "照"}
+
+data: {"token": "，"}
+
+data: {"token": "\n"}
+
+data: {"token": "<七绝>"}
+
+data: {"token": "花"}
+
+data: {"token": "前"}
+
+data: {"token": "秋"}
+
+data: {"token": "月"}
+
+data: [DONE]
+
+
+=== POST /v1/completions（非法 JSON → 应 400） ===
+{"error": "bad json"}  <HTTP 400>
+
+=== GET /stats（已有请求） ===
+{"count": 3, "avg_ms": 119.867, "p50_ms": 102.8, "p99_ms": 156.36}
+

@@ -16,7 +16,8 @@
    - BoN 自蒸馏混合再训
    - 格律评估与 A/B 对照、句长约束采样
 
-形态为「训练 + 工具链」，不含 HTTP 推理服务与命令行生成器。
+形态为「训练 + 工具链 + HTTP 推理服务」：`server.py` 提供单推理线程串行调度的推理接口
+（非流式 + SSE 流式，Task 6）；命令行生成器（Task 7）仍未实现。
 
 ## 二、系统架构
 
@@ -41,6 +42,11 @@
 │ M3：tools/selftrain.py —— BoN 自蒸馏混合再训           │
 │ 评估：tools/prosody_eval.py —— 旧档 / M1 / M2 / M3     │
 └────────────────────────────────────────────────────────┘
+                           ▼
+┌──────────────── 服务层（server.py）──────────────────┐
+│ HTTP 线程入队 → 唯一推理线程串行生成（不并发碰模型） │
+│ /v1/completions（非流式 / SSE）· /stats · /health    │
+└──────────────────────────────────────────────────────┘
 ```
 
 采样期可用 `meter.py` 的句长约束处理器（作为 `logits_processor` 挂在 `GPT.generate` 上）强制半句字数与断句。
@@ -67,10 +73,11 @@
 ```
 Minimal-LLM/
 ├── README.md            # 本文档（设计 + 使用说明）
-├── PLAN.md              # 早期分阶段实现计划（Task 6/7 的 HTTP 推理服务与 CLI 未实现，不在本仓库范围内）
+├── PLAN.md              # 早期分阶段实现计划（Task 6 HTTP 推理服务已实现；Task 7 CLI 未实现，不在本仓库范围内）
 ├── prosody.py           # 格律工具：平水韵查表（字→平仄/韵部）+ 句长/押韵/平仄/对仗判定 + 综合打分
 ├── meter.py             # 采样期句长约束处理器（挂到 GPT.generate 的 logits_processor）
 ├── train.py             # 数据加载 / 编码 / 加权损失抽题 / AdamW / 学习率调度 / 续训 checkpoint / 训练循环
+├── server.py            # HTTP 推理服务：单推理线程串行调度 + SSE 流式 + 延迟统计（/health、/stats、/v1/completions）
 ├── model/
 │   ├── __init__.py
 │   ├── backend.py       # 计算后端总闸：默认 numpy(CPU)；MINIMAL_GPU=1 且探活通过时切 cupy(GPU)
@@ -84,7 +91,7 @@ Minimal-LLM/
 │   ├── selftrain.py      # BoN 自蒸馏：prompt 池 → 候选生成 → 格律筛选 → 混合集 → 混合再训（M3）
 │   └── prosody_eval.py   # 格律内化评估与 A/B 对照（旧档 / M1 / M2 / M3）
 ├── data/                # 语料、韵书、逐位置元信息、自蒸馏产物（详见下）
-├── test/                # 单元测试（18 个用例文件，自带逐项输出与退出码约定：✓/✗ 或 PASS 风格）
+├── test/                # 单元测试（19 个用例文件，自带逐项输出与退出码约定：✓/✗ 或 PASS 风格）
 ├── logs/                # 训练运行日志（本地产物，不入库）
 └── _probe/              # 构建期原始数据与离线依赖（本地产物，不入库）
 ```
@@ -269,6 +276,7 @@ python test/test_vocab_migrate.py
 python test/test_selftrain.py
 python test/test_prosody_eval.py
 python test/test_backend_gpu.py
+python test/test_server.py
 ```
 
 汇总运行（PowerShell，逐个运行并汇报失败项）：
@@ -279,3 +287,65 @@ Get-ChildItem test -Filter "test_*.py" | ForEach-Object {
     if ($LASTEXITCODE -ne 0) { Write-Host "FAILED: $($_.Name)（退出码 $LASTEXITCODE）" }
 }
 ```
+
+### 7. HTTP 推理服务（Task 6）
+
+```bash
+python server.py --model model-gelv-m3.npz --host 127.0.0.1 --port 8000
+```
+
+参数：`--model` 权重档路径（默认 `model-gelv-m3.npz`）、`--host`（默认 `127.0.0.1`）、
+`--port`（默认 `8000`）、`--timeout` 单请求等待上限秒数（默认 `60`）、
+`--cap` `/stats` 环形缓冲容量（默认 `200`）。
+
+**线程模型**：`GPT.forward` 会把 KV Cache 等中间量写入实例属性，并发调用即构成数据竞争。
+故模型只有一个主人——全局唯一推理线程串行消费请求队列，HTTP 线程仅入队并用
+`threading.Event` 等待完成信号，无需对模型加锁。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/health` | `{"status":"ok","model":...,"ctx_len":128}` |
+| GET | `/stats` | `{"count","avg_ms","p50_ms","p99_ms"}`；无请求时返回 `{}`（不编造数字） |
+| POST | `/v1/completions` | 生成：非流式 JSON，或 `stream: true` 走 SSE |
+
+请求字段（除 `prompt` 外均可省略）：
+
+| 字段 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `prompt` | str | 必填 | 起句；分词后为空即报错，不做兜底 |
+| `style` | str | 无 | `五绝`/`七绝`/`五律`/`七律`/`杂言`；给出时在 prompt 前拼对应 `<诗体>` token |
+| `max_tokens` | int | 32 | 续写 token 数；须满足 `prompt_tokens + max_tokens ≤ ctx_len(128)` |
+| `temperature` | float | 0.8 | 必须 > 0 |
+| `top_k` | int | 20 | ≤ 0 或 null 视为不启用 |
+| `top_p` | float | null | null 视为不启用 |
+| `stream` | bool | false | true 时返回 SSE |
+| `enforce_meter` | bool | false | true 时挂采样期句长约束；词表缺「，」「。」则 `500 meter constraint unavailable` |
+
+非流式响应示例：
+
+```json
+{"text": "。\n<五律>一家有儿妾", "prompt": "床前明月光", "style": null,
+ "head": "床前明月光", "tokens": 8, "queued_ms": 0.05, "elapsed_ms": 156.36}
+```
+
+`oov_dropped` 仅在确有词表外字符被跳过时出现。流式响应为 `text/event-stream`，
+逐 token 一条事件，末尾以 `[DONE]` 收尾：
+
+```
+data: {"token": "照"}
+
+data: {"token": "，"}
+
+data: [DONE]
+```
+
+错误约定：`400` 客户端错误（`bad json` / `invalid style` / `empty prompt after tokenize` /
+`prompt too long`（附 `prompt_tokens` 与 `max_tokens_available`）/ `invalid max_tokens` /
+`invalid temperature` / `invalid field type`）；`404` 路径不存在；`500` 推理异常
+（附 `type` 与 `detail`）；`504` 非流式等待超时。
+
+已知限制：流式响应头一旦发出，状态码即锁死，故流式的超时与吐字途中异常改在事件流内推
+`data: {"error": ...}` 并以 `[DONE]` 收尾；另无 KV Cache 前缀复用。
+
+自测：`python test/test_server.py`（35 条用例：真档形状交叉校验、7 类客户端错误、
+并发 4、500/504、流式与断连取消）；实跑留痕见 `test/output-server.txt`。
