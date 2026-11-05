@@ -307,7 +307,7 @@ class GPT:
         return dy
 
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None,
-                 kv_cache=None, logits_processor=None):
+                 kv_cache=None, logits_processor=None, on_token=None):
         """自回归生成：从 idx [1,T] 续写 max_new_tokens 个 token，返回 [1, T+new]。
 
         kv_cache 为空则内部初始化（每层一份 [K,V] 空缓存）：prefill 一次把整段
@@ -316,6 +316,9 @@ class GPT:
 
         logits_processor：可选回调 (logits[V], idx[1,T]) -> logits[V]，采样前对得分做
         一次加工；默认 None 时行为与旧版逐位一致（内核不感知任何外置规则）。
+
+        on_token：可选回调 (token_id: int)，每采样出一个 token 并拼回序列后立即调用，
+        供流式服务逐 token 回推；默认 None 时生成结果与采样流均与旧版逐位一致。
         """
         if kv_cache is None:
             head_dim = self.d_model // self.n_head    # 每头维度（与注意力层一致）
@@ -333,6 +336,9 @@ class GPT:
                 step_logits = logits_processor(step_logits, idx)
             next_token = _sample(step_logits, temperature, top_k, top_p)  # 采样 [1,1]
             idx = np.concatenate([idx, next_token], axis=1)   # 新 token 拼回序列
+            if on_token is not None:
+                # 逐 token 回推（形状 [1,1] 取标量）；放在拼接之后，回调所见即最终序列新增部分
+                on_token(int(next_token[0, 0]))
         return idx
 
     def _named_params(self):

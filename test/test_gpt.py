@@ -47,6 +47,21 @@ def test_parameter_count():
     print("param count:", n)
     assert n > 0
 
+def test_generate_on_token_callback():
+    """on_token 回调：逐 token 通知，且绝不改变生成结果（默认 None 为零回归）。"""
+    gpt = GPT(vocab_size=30, d_model=16, n_head=4, n_layer=2, ctx_len=10)
+    idx = np.array([[1, 2, 3]])                  # prompt 长 3；ctx_len=10，续写 5 不越界
+    np.random.seed(1234)
+    base = gpt.generate(idx, 5, temperature=1.0, top_k=None)   # 不传回调（旧路径）
+    seen = []
+    np.random.seed(1234)                         # 复位同一采样流：两次应逐位相同
+    out = gpt.generate(idx, 5, temperature=1.0, top_k=None, on_token=seen.append)
+    assert np.array_equal(base, out), "传 on_token 不得改变生成结果（零回归被破坏）"
+    assert seen == [int(t) for t in out[0, idx.shape[1]:]], \
+        f"回调收到的 token 应逐项等于新增部分：{seen} vs {out[0, idx.shape[1]:].tolist()}"
+    print("generate on_token PASS", seen)
+
 if __name__ == "__main__":
     test_gpt_loss_and_backward(); test_gpt_kv_cache(); test_save_load(); test_parameter_count()
+    test_generate_on_token_callback()
     print("ALL GPT TESTS PASS")
